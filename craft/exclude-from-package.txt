@@ -1,0 +1,7 @@
+# Files removed from the published .7z after packaging (one relative path per line; '#' = comment).
+# Only for false positives of desktop antivirus heuristics that would block the whole package on users' machines.
+# Each entry: date, scanner, evidence. Remove the entry once the vendor whitelists the file.
+#
+# 2026-11-13 build-3: Kaspersky 21.27 deletes this frei0r transition plugin right after extraction; Microsoft Defender scan of the same
+# file: no threats. Upstream frei0r source, built by KDE Craft (the official Kdenlive 26.08.2 build of the same plugin is not flagged).
+lib/frei0r-1/sleid0r_wipe-up.dll

@@ -84,6 +84,16 @@ jobs:
           Write-Host "package dir: $pkg"
           New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/out" | Out-Null
           Get-ChildItem -Path $pkg -Recurse -Include *.exe, *.7z | Copy-Item -Destination "$env:GITHUB_WORKSPACE/out"
+          # repack the .7z without the files listed in craft/exclude-from-package.txt (antivirus false positives, documented there)
+          $excl = @(Get-Content "$env:GITHUB_WORKSPACE/craft/exclude-from-package.txt" | Where-Object { $_.Trim() -and -not $_.StartsWith('#') } | ForEach-Object { $_.Trim().Replace('/', '') })
+          $orig = Get-ChildItem "$env:GITHUB_WORKSPACE/out/*.7z" | Select-Object -First 1
+          $tmp = "C:/repack"
+          & 7z x $orig.FullName "-o$tmp" -y | Out-Null; if ($LASTEXITCODE) { exit 1 }
+          foreach ($e in $excl) { $f = Join-Path $tmp $e; if (Test-Path $f) { Remove-Item $f -Force; Write-Host "excluded $e" } else { Write-Host "not present: $e" } }
+          Remove-Item $orig.FullName
+          Push-Location $tmp
+          & 7z a -t7z -mx=7 "$env:GITHUB_WORKSPACE/out/kdenlive-vas-$env:GITHUB_RUN_NUMBER-windows-x86_64.7z" * | Out-Null; if ($LASTEXITCODE) { exit 1 }
+          Pop-Location
           Get-ChildItem "$env:GITHUB_WORKSPACE/out" | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content "$env:GITHUB_WORKSPACE/out/SHA256SUMS.txt" -Encoding ascii
           Get-ChildItem "$env:GITHUB_WORKSPACE/out"
 
@@ -93,7 +103,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $notes = "Kdenlive $env:KDENLIVE_TAG + VAS patches ($env:GITHUB_SHA). Unsigned test build - verify SHA256SUMS.txt. Source: upstream tag + patches/ in this repository (GPL-3.0)."
+          $notes = "Kdenlive $env:KDENLIVE_TAG + VAS patches ($env:GITHUB_SHA). Unsigned test build - verify SHA256SUMS.txt. The .7z omits the files listed in craft/exclude-from-package.txt (antivirus false positives); the .exe installer is Craft's original output. Source: upstream tag + patches/ in this repository (GPL-3.0)."
           gh release create "build-$env:GITHUB_RUN_NUMBER" (Get-ChildItem "$env:GITHUB_WORKSPACE/out").FullName --prerelease --title "Kdenlive VAS build $env:GITHUB_RUN_NUMBER" --notes $notes --target $env:GITHUB_SHA
 
       - name: Publish logs on failure
