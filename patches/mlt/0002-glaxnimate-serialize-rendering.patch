@@ -1,0 +1,28 @@
+diff --git a/src/modules/glaxnimate/producer_glaxnimate.cpp b/src/modules/glaxnimate/producer_glaxnimate.cpp
+index fdcde8f..dfda484 100644
+--- a/src/modules/glaxnimate/producer_glaxnimate.cpp
++++ b/src/modules/glaxnimate/producer_glaxnimate.cpp
+@@ -22,6 +22,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <framework/mlt.h>
++#include <mutex>
+ #include <QApplication>
+ #include <QPainter>
+ 
+@@ -204,6 +205,15 @@ static int get_image(mlt_frame frame,
+     auto producer = static_cast<mlt_producer>(mlt_frame_pop_service(frame));
+     auto glax = static_cast<Glaxnimate *>(producer->child);
+ 
++    // Glaxnimate's model is not thread safe: render_image() sets the composition's current time on the
++    // shared document before painting, and "refresh" replaces the document. With parallel rendering
++    // (real_time < -1, used by Kdenlive) several threads call this at once -> data race, reads of garbage
++    // pointers and heap corruption (Windows: 0xC0000005 in this module, 0xC0000374; most Kdenlive renders of
++    // a timeline with Glaxnimate clips crashed in our tests). The library also has process-wide state
++    // (format registry, fonts), so serialize all Glaxnimate rendering; other services still render in parallel.
++    static std::mutex render_mutex;
++    std::lock_guard<std::mutex> guard(render_mutex);
++
+     if (mlt_properties_get_int(glax->properties(), "refresh")) {
+         mlt_properties_clear(glax->properties(), "refresh");
+         glax->open(mlt_properties_get(glax->properties(), "resource"));

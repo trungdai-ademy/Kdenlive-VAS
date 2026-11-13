@@ -44,6 +44,14 @@ The patch (Windows only):
   ends the process without the DLL teardown.
 
 To be proposed upstream (a fix inside Qt or the Qt module would cover in-process MLT users too).
+## MLT patch (`patches/mlt/0002-glaxnimate-serialize-rendering.patch`)
+
+MLT's Glaxnimate producer renders on a shared, non thread-safe document: `render_image()` sets the composition time on the document
+before painting, and `refresh` replaces the document. Kdenlive renders with several threads (`real_time` < -1), so timelines with
+Glaxnimate (Lottie) clips crashed in `libmltglaxnimate-qt6.dll` (0xC0000005 / heap corruption 0xC0000374): measured with
+`kdenlive --render` on the same timeline, official Kdenlive 26.08.2 crashed 1 of 5 runs, our build 14 (newer Qt / libraries) 5 of 5.
+The patch serializes all Glaxnimate rendering with one process-wide mutex (the library also has process-wide state); other services
+keep rendering in parallel. The MLT licence note below applies (this file is GPL-3.0-or-later, as upstream).
 ## Licence
 
 Kdenlive is free software released under the GNU General Public License, version 3 (see `LICENSE`, copied from Kdenlive's
