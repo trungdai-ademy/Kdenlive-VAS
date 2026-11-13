@@ -1,4 +1,4 @@
-From a7477a8bd2447f1447b7a4e7a280ccf0368b4ad2 Mon Sep 17 00:00:00 2001
+From 9e36f477e4f6ae941af6fc07c5e1a8edd11c1f6d Mon Sep 17 00:00:00 2001
 From: Vietnews AI Studio <noreply@vietnews.invalid>
 Date: Fri, 13 Nov 2026 15:25:54 +1000
 Subject: [PATCH] VAS live-control bridge (inactive unless started by Vietnews
@@ -11,9 +11,9 @@ request* functions with undo, so the user can Ctrl+Z every AI edit.
  src/CMakeLists.txt     |   1 +
  src/mainwindow.cpp     |   4 +
  src/vas/CMakeLists.txt |   8 ++
- src/vas/vasbridge.cpp  | 293 +++++++++++++++++++++++++++++++++++++++++
+ src/vas/vasbridge.cpp  | 310 +++++++++++++++++++++++++++++++++++++++++
  src/vas/vasbridge.h    |  49 +++++++
- 5 files changed, 355 insertions(+)
+ 5 files changed, 372 insertions(+)
  create mode 100644 src/vas/CMakeLists.txt
  create mode 100644 src/vas/vasbridge.cpp
  create mode 100644 src/vas/vasbridge.h
@@ -68,10 +68,10 @@ index 0000000..71fa4a7
 +  PARENT_SCOPE)
 diff --git a/src/vas/vasbridge.cpp b/src/vas/vasbridge.cpp
 new file mode 100644
-index 0000000..44cdf42
+index 0000000..1db4137
 --- /dev/null
 +++ b/src/vas/vasbridge.cpp
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,310 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 Vietnews AI Studio contributors
 +    SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
@@ -93,6 +93,10 @@ index 0000000..44cdf42
 +#include <QJsonDocument>
 +#include <QLocalSocket>
 +#include <QRegularExpression>
++
++#include <algorithm>
++#include <unordered_set>
++#include <vector>
 +
 +namespace {
 +constexpr int kMaxLine = 64 * 1024;      // one request never exceeds 64 KB
@@ -138,11 +142,21 @@ index 0000000..44cdf42
 +    return pCore->window()->getCurrentTimeline()->model();
 +}
 +
++// Track ids in timeline order, taken from the MODEL's own track list. Do not use getTracksCount() + getTrackIndexFromPosition():
++// getTracksCount() counts the MLT tractor, which can differ from the model's list while a project is loading (only a Q_ASSERT checks
++// it, disabled in release builds) -> getTrackIndexFromPosition() walks past the end (0xC0000005 seen in the first live test).
++std::vector<int> orderedTracks(const std::shared_ptr<TimelineItemModel> &tl)
++{
++    const std::unordered_set<int> ids = tl->getAllTracksIds();
++    std::vector<int> v(ids.begin(), ids.end());
++    std::sort(v.begin(), v.end(), [&tl](int a, int b) { return tl->getTrackPosition(a) < tl->getTrackPosition(b); });
++    return v;
++}
++
 +// track tag ("V1", "A2") → track id; -1 when unknown
 +int trackFromTag(const std::shared_ptr<TimelineItemModel> &tl, const QString &tag)
 +{
-+    for (int pos = 0; pos < tl->getTracksCount(); ++pos) {
-+        const int tid = tl->getTrackIndexFromPosition(pos);
++    for (int tid : orderedTracks(tl)) {
 +        if (tl->getTrackTagById(tid) == tag) {
 +            return tid;
 +        }
@@ -224,11 +238,12 @@ index 0000000..44cdf42
 +{
 +    QJsonObject st;
 +    auto tl = timeline();
-+    if (!tl) {
++    KdenliveDoc *doc = pCore ? pCore->currentDoc() : nullptr;
++    // no answer while a project is still being opened (no document yet): the caller polls again
++    if (!tl || !doc) {
 +        st.insert(QStringLiteral("open"), false);
 +        return st;
 +    }
-+    KdenliveDoc *doc = pCore->currentDoc();
 +    st.insert(QStringLiteral("open"), true);
 +    st.insert(QStringLiteral("file"), doc ? doc->url().toLocalFile() : QString());
 +    st.insert(QStringLiteral("dirty"), doc && doc->isModified());
@@ -237,8 +252,10 @@ index 0000000..44cdf42
 +    QJsonArray tracks;
 +    QJsonArray items;
 +    int count = 0;
-+    for (int pos = 0; pos < tl->getTracksCount(); ++pos) {
-+        const int tid = tl->getTrackIndexFromPosition(pos);
++    for (int tid : orderedTracks(tl)) {
++        if (tl->isSubtitleTrack(tid)) {
++            continue;
++        }
 +        const QString tag = tl->getTrackTagById(tid);
 +        tracks.append(QJsonObject{{QStringLiteral("id"), tid}, {QStringLiteral("tag"), tag}, {QStringLiteral("audio"), tl->isAudioTrack(tid)}});
 +        for (int item : tl->getItemsInRange(tid, 0, -1, true)) {
