@@ -1,0 +1,97 @@
+# Build Kdenlive (upstream tag) + VAS patches for Windows with KDE Craft, the same way KDE's CI builds the official installer
+# (invent.kde.org/sysadmin/craft-ci gitlab-templates/blocks/windows-base.yml). Result (or the Craft logs on failure) is published as a
+# GitHub pre-release so it can be downloaded without credentials and then verified by VAS's safety gate before use.
+name: build-windows
+
+on:
+  push:
+    branches: [main]
+    paths: ["patches/**", "craft/**", ".github/workflows/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    env:
+      PYTHONUTF8: "1"
+      KDENLIVE_TAG: v26.08.2
+      CRAFT_TARGET: windows-msvc2022_64-cl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upstream source + VAS patches
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch $env:KDENLIVE_TAG https://invent.kde.org/multimedia/kdenlive.git C:/kdenlive-src
+          if ($LASTEXITCODE) { exit 1 }
+          Push-Location C:/kdenlive-src
+          foreach ($p in Get-ChildItem "$env:GITHUB_WORKSPACE/patches/*.patch" | Sort-Object Name) {
+            git apply --check $p.FullName; if ($LASTEXITCODE) { Write-Error "patch does not apply: $($p.Name)"; exit 1 }
+            git apply $p.FullName
+            Write-Host "applied $($p.Name)"
+          }
+          Pop-Location
+
+      - name: Craft tooling
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force C:/Craft | Out-Null
+          git clone --depth 1 https://invent.kde.org/packaging/craftmaster.git C:/Craft/craftmaster
+          $py = (Split-Path (Get-Command python).Source).Replace('\', '/')
+          (Get-Content "$env:GITHUB_WORKSPACE/craft/CraftConfig.ini" -Raw).Replace('@PYTHON_DIR@', $py) | Set-Content C:/Craft/CraftConfig.ini -Encoding utf8
+
+      - name: Build and package
+        shell: pwsh
+        run: |
+          Set-Location C:/Craft
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/logs" | Out-Null
+          $log = "$env:GITHUB_WORKSPACE/logs/build.log"
+          # full output kept in logs/build.log (published on failure); the console shows each step's tail
+          function CM {
+            "===== CraftMaster $args" | Add-Content $log
+            python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET @args *>> $log
+            $code = $LASTEXITCODE
+            Get-Content $log -Tail 25
+            if ($code -ne 0) { exit $code }
+          }
+          CM --setup
+          CM -c -i --options virtual.ignored=True --update craft
+          CM -c --install-deps --options "[CodeSigning]Enabled=False" kdenlive
+          CM -c --no-cache --options "kdenlive.srcDir=C:/kdenlive-src" kdenlive
+          CM -c -i --update nsis
+          CM -c --package --options "kdenlive.srcDir=C:/kdenlive-src" kdenlive
+          $pkg = (python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET -c -q --get "packageDestinationDir()" virtual/base | Select-Object -Last 1).Trim()
+          Write-Host "package dir: $pkg"
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/out" | Out-Null
+          Get-ChildItem -Path $pkg -Recurse -Include *.exe, *.7z | Copy-Item -Destination "$env:GITHUB_WORKSPACE/out"
+          Get-ChildItem "$env:GITHUB_WORKSPACE/out" | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content "$env:GITHUB_WORKSPACE/out/SHA256SUMS.txt" -Encoding ascii
+          Get-ChildItem "$env:GITHUB_WORKSPACE/out"
+
+      - name: Publish build
+        if: success()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = "Kdenlive $env:KDENLIVE_TAG + VAS patches ($env:GITHUB_SHA). Unsigned test build - verify SHA256SUMS.txt. Source: upstream tag + patches/ in this repository (GPL-3.0)."
+          gh release create "build-$env:GITHUB_RUN_NUMBER" (Get-ChildItem "$env:GITHUB_WORKSPACE/out").FullName --prerelease --title "Kdenlive VAS build $env:GITHUB_RUN_NUMBER" --notes $notes --target $env:GITHUB_SHA
+
+      - name: Publish logs on failure
+        if: failure()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $logs = "C:/Craft/$env:CRAFT_TARGET/logs"
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/logs" | Out-Null
+          if (Test-Path $logs) { Compress-Archive -Path "$logs/*" -DestinationPath "$env:GITHUB_WORKSPACE/logs/craft-logs.zip" -Force }
+          "run $env:GITHUB_RUN_NUMBER failed at $(Get-Date -Format o)" | Set-Content "$env:GITHUB_WORKSPACE/logs/README.txt"
+          gh release create "logs-$env:GITHUB_RUN_NUMBER" (Get-ChildItem "$env:GITHUB_WORKSPACE/logs").FullName --prerelease --title "Build logs $env:GITHUB_RUN_NUMBER (failed)" --notes "Craft logs of a failed build." --target $env:GITHUB_SHA

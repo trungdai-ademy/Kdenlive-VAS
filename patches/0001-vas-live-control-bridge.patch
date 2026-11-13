@@ -1,0 +1,425 @@
+From a7477a8bd2447f1447b7a4e7a280ccf0368b4ad2 Mon Sep 17 00:00:00 2001
+From: Vietnews AI Studio <noreply@vietnews.invalid>
+Date: Fri, 13 Nov 2026 15:25:54 +1000
+Subject: [PATCH] VAS live-control bridge (inactive unless started by Vietnews
+ AI Studio)
+
+Local server (same-user only, per-launch token) exposing the timeline state and a fixed set of
+edits (move, cut, resize, delete, insert, effect, seek, save) through the timeline model's own
+request* functions with undo, so the user can Ctrl+Z every AI edit.
+---
+ src/CMakeLists.txt     |   1 +
+ src/mainwindow.cpp     |   4 +
+ src/vas/CMakeLists.txt |   8 ++
+ src/vas/vasbridge.cpp  | 293 +++++++++++++++++++++++++++++++++++++++++
+ src/vas/vasbridge.h    |  49 +++++++
+ 5 files changed, 355 insertions(+)
+ create mode 100644 src/vas/CMakeLists.txt
+ create mode 100644 src/vas/vasbridge.cpp
+ create mode 100644 src/vas/vasbridge.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 31d77ec..2ff0b9c 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -64,6 +64,7 @@ add_subdirectory(timeline2)
+ add_subdirectory(titler)
+ add_subdirectory(transitions)
+ add_subdirectory(utils)
++add_subdirectory(vas)
+ add_subdirectory(widgets)
+ add_subdirectory(xml)
+ add_subdirectory(layouts)
+diff --git a/src/mainwindow.cpp b/src/mainwindow.cpp
+index 343a5b8..971f16b 100644
+--- a/src/mainwindow.cpp
++++ b/src/mainwindow.cpp
+@@ -37,6 +37,7 @@ SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+ #include "layouts/layoutmanagement.h"
+ #include "library/librarywidget.h"
+ #include "render/renderserver.h"
++#include "vas/vasbridge.h"
+ 
+ #ifndef NODBUS
+ #include <QDBusConnectionInterface>
+@@ -180,6 +181,9 @@ void MainWindow::init()
+ 
+     // Handle communication with the renderer app
+     new RenderServer(this);
++    if (VasBridge::enabled()) {
++        new VasBridge(this); // VAS live control (only when started by Vietnews AI Studio)
++    }
+     QString defaultProfile = KdenliveSettings::default_profile();
+ 
+     pCore->setCurrentProfile(defaultProfile.isEmpty() ? ProjectManager::getDefaultProjectFormat() : defaultProfile);
+diff --git a/src/vas/CMakeLists.txt b/src/vas/CMakeLists.txt
+new file mode 100644
+index 0000000..71fa4a7
+--- /dev/null
++++ b/src/vas/CMakeLists.txt
+@@ -0,0 +1,8 @@
++# SPDX-License-Identifier: BSD-2-Clause
++# SPDX-FileCopyrightText: 2026 Vietnews AI Studio contributors
++# VAS live-control bridge: inactive unless VAS Desk starts Kdenlive with VAS_KDENLIVE_PIPE + VAS_KDENLIVE_TOKEN.
++
++set(kdenlive_SRCS
++  ${kdenlive_SRCS}
++  vas/vasbridge.cpp
++  PARENT_SCOPE)
+diff --git a/src/vas/vasbridge.cpp b/src/vas/vasbridge.cpp
+new file mode 100644
+index 0000000..44cdf42
+--- /dev/null
++++ b/src/vas/vasbridge.cpp
+@@ -0,0 +1,293 @@
++/*
++    SPDX-FileCopyrightText: 2026 Vietnews AI Studio contributors
++    SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++#include "vasbridge.h"
++#include "bin/projectclip.h"
++#include "bin/projectitemmodel.h"
++#include "core.h"
++#include "doc/kdenlivedoc.h"
++#include "mainwindow.h"
++#include "project/projectmanager.h"
++#include "timeline2/model/timelinefunctions.hpp"
++#include "timeline2/model/timelineitemmodel.hpp"
++#include "timeline2/view/timelinewidget.h"
++
++#include <QCryptographicHash>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QLocalSocket>
++#include <QRegularExpression>
++
++namespace {
++constexpr int kMaxLine = 64 * 1024;      // one request never exceeds 64 KB
++constexpr int kMaxFrame = 100000000;     // ~ 46 days at 25 fps
++constexpr int kMaxItems = 20000;         // state size guard
++
++bool constantTimeEqual(const QByteArray &a, const QByteArray &b)
++{
++    if (a.size() != b.size()) {
++        return false;
++    }
++    unsigned char diff = 0;
++    for (int i = 0; i < a.size(); ++i) {
++        diff |= static_cast<unsigned char>(a.at(i) ^ b.at(i));
++    }
++    return diff == 0;
++}
++
++bool intArg(const QJsonObject &o, const char *key, int min, int max, int &out)
++{
++    const QJsonValue v = o.value(QLatin1String(key));
++    if (!v.isDouble()) {
++        return false;
++    }
++    const double d = v.toDouble();
++    if (d != static_cast<double>(static_cast<long long>(d)) || d < min || d > max) {
++        return false;
++    }
++    out = static_cast<int>(d);
++    return true;
++}
++
++QJsonObject fail(int id, const QString &msg)
++{
++    return QJsonObject{{QStringLiteral("id"), id}, {QStringLiteral("ok"), false}, {QStringLiteral("msg"), msg}};
++}
++
++std::shared_ptr<TimelineItemModel> timeline()
++{
++    if (!pCore || !pCore->window() || !pCore->window()->getCurrentTimeline()) {
++        return nullptr;
++    }
++    return pCore->window()->getCurrentTimeline()->model();
++}
++
++// track tag ("V1", "A2") → track id; -1 when unknown
++int trackFromTag(const std::shared_ptr<TimelineItemModel> &tl, const QString &tag)
++{
++    for (int pos = 0; pos < tl->getTracksCount(); ++pos) {
++        const int tid = tl->getTrackIndexFromPosition(pos);
++        if (tl->getTrackTagById(tid) == tag) {
++            return tid;
++        }
++    }
++    return -1;
++}
++} // namespace
++
++bool VasBridge::enabled()
++{
++    return qEnvironmentVariableIsSet("VAS_KDENLIVE_PIPE") && qEnvironmentVariableIsSet("VAS_KDENLIVE_TOKEN");
++}
++
++VasBridge::VasBridge(QObject *parent)
++    : QObject(parent)
++{
++    const QString name = qEnvironmentVariable("VAS_KDENLIVE_PIPE");
++    m_token = qEnvironmentVariable("VAS_KDENLIVE_TOKEN").toUtf8();
++    // do not leak the secret to child processes (render jobs, glaxnimate…)
++    qunsetenv("VAS_KDENLIVE_TOKEN");
++    if (m_token.size() < 32 || name.isEmpty() || name.size() > 100) {
++        qWarning() << "VAS bridge disabled: invalid launch parameters";
++        return;
++    }
++    m_server.setSocketOptions(QLocalServer::UserAccessOption);
++    m_server.setMaxPendingConnections(2);
++    if (m_server.listen(name)) {
++        connect(&m_server, &QLocalServer::newConnection, this, &VasBridge::connected);
++    } else {
++        qWarning() << "VAS bridge failed to listen on" << name;
++    }
++}
++
++VasBridge::~VasBridge() = default;
++
++void VasBridge::connected()
++{
++    while (QLocalSocket *socket = m_server.nextPendingConnection()) {
++        connect(socket, &QLocalSocket::readyRead, this, &VasBridge::readSocket);
++        connect(socket, &QLocalSocket::disconnected, socket, &QObject::deleteLater);
++    }
++}
++
++void VasBridge::readSocket()
++{
++    auto *socket = qobject_cast<QLocalSocket *>(sender());
++    if (!socket) {
++        return;
++    }
++    while (socket->canReadLine()) {
++        const QByteArray line = socket->readLine(kMaxLine + 1);
++        if (line.size() > kMaxLine) {
++            socket->abort();
++            return;
++        }
++        QJsonParseError err;
++        const QJsonDocument doc = QJsonDocument::fromJson(line, &err);
++        QJsonObject reply;
++        if (err.error != QJsonParseError::NoError || !doc.isObject()) {
++            reply = fail(0, QStringLiteral("bad json"));
++        } else {
++            const QJsonObject req = doc.object();
++            if (!constantTimeEqual(req.value(QStringLiteral("token")).toString().toUtf8(), m_token)) {
++                // wrong secret: drop the connection, do not answer details
++                socket->abort();
++                return;
++            }
++            reply = handle(req);
++        }
++        socket->write(QJsonDocument(reply).toJson(QJsonDocument::Compact) + '\n');
++        socket->flush();
++    }
++    if (socket->bytesAvailable() > kMaxLine) {
++        socket->abort();
++    }
++}
++
++QJsonObject VasBridge::state() const
++{
++    QJsonObject st;
++    auto tl = timeline();
++    if (!tl) {
++        st.insert(QStringLiteral("open"), false);
++        return st;
++    }
++    KdenliveDoc *doc = pCore->currentDoc();
++    st.insert(QStringLiteral("open"), true);
++    st.insert(QStringLiteral("file"), doc ? doc->url().toLocalFile() : QString());
++    st.insert(QStringLiteral("dirty"), doc && doc->isModified());
++    st.insert(QStringLiteral("fps"), pCore->getCurrentFps());
++    st.insert(QStringLiteral("duration"), tl->duration());
++    QJsonArray tracks;
++    QJsonArray items;
++    int count = 0;
++    for (int pos = 0; pos < tl->getTracksCount(); ++pos) {
++        const int tid = tl->getTrackIndexFromPosition(pos);
++        const QString tag = tl->getTrackTagById(tid);
++        tracks.append(QJsonObject{{QStringLiteral("id"), tid}, {QStringLiteral("tag"), tag}, {QStringLiteral("audio"), tl->isAudioTrack(tid)}});
++        for (int item : tl->getItemsInRange(tid, 0, -1, true)) {
++            if (++count > kMaxItems) {
++                st.insert(QStringLiteral("truncated"), true);
++                break;
++            }
++            QJsonObject it{{QStringLiteral("id"), item}, {QStringLiteral("track"), tag}};
++            if (tl->isClip(item)) {
++                it.insert(QStringLiteral("kind"), QStringLiteral("clip"));
++                it.insert(QStringLiteral("bin"), tl->getClipBinId(item));
++                it.insert(QStringLiteral("name"), tl->getClipName(item));
++                it.insert(QStringLiteral("position"), tl->getClipPosition(item));
++                it.insert(QStringLiteral("in"), tl->getClipIn(item));
++                it.insert(QStringLiteral("length"), tl->getClipPlaytime(item));
++            } else if (tl->isComposition(item)) {
++                it.insert(QStringLiteral("kind"), QStringLiteral("composition"));
++                it.insert(QStringLiteral("position"), tl->getCompositionPosition(item));
++                it.insert(QStringLiteral("length"), tl->getCompositionPlaytime(item));
++            } else {
++                continue;
++            }
++            items.append(it);
++        }
++    }
++    st.insert(QStringLiteral("tracks"), tracks);
++    st.insert(QStringLiteral("items"), items);
++    QJsonArray bin;
++    if (auto model = pCore->projectItemModel()) {
++        int n = 0;
++        for (const QString &bid : model->getAllClipIds()) {
++            if (++n > kMaxItems) {
++                break;
++            }
++            if (auto clip = model->getClipByBinID(bid)) {
++                bin.append(QJsonObject{{QStringLiteral("bin"), bid}, {QStringLiteral("name"), clip->clipName()}, {QStringLiteral("url"), clip->url()}});
++            }
++        }
++    }
++    st.insert(QStringLiteral("bin"), bin);
++    // short fingerprint so VAS can skip unchanged states cheaply
++    st.insert(QStringLiteral("hash"),
++              QString::fromLatin1(QCryptographicHash::hash(QJsonDocument(items).toJson(QJsonDocument::Compact), QCryptographicHash::Sha1).toHex().left(16)));
++    return st;
++}
++
++QJsonObject VasBridge::handle(const QJsonObject &req)
++{
++    int id = 0;
++    intArg(req, "id", 0, 1 << 30, id);
++    const QString op = req.value(QStringLiteral("op")).toString();
++    if (op == QLatin1String("state")) {
++        return QJsonObject{{QStringLiteral("id"), id}, {QStringLiteral("ok"), true}, {QStringLiteral("state"), state()}};
++    }
++    auto tl = timeline();
++    if (!tl) {
++        return fail(id, QStringLiteral("no timeline open"));
++    }
++    bool ok = false;
++    QString msg;
++    int item = -1;
++    if (op == QLatin1String("move")) {
++        int pos = 0;
++        const int tid = trackFromTag(tl, req.value(QStringLiteral("track")).toString());
++        if (!intArg(req, "item", 0, 1 << 30, item) || !tl->isClip(item) || tid < 0 || !intArg(req, "position", 0, kMaxFrame, pos)) {
++            return fail(id, QStringLiteral("move: item (clip id), track (tag), position"));
++        }
++        ok = tl->requestClipMove(item, tid, pos, true, true, true);
++        msg = ok ? QStringLiteral("moved") : QStringLiteral("move refused by timeline (overlap / locked track?)");
++    } else if (op == QLatin1String("cut")) {
++        int pos = 0;
++        if (!intArg(req, "item", 0, 1 << 30, item) || !tl->isClip(item) || !intArg(req, "position", 0, kMaxFrame, pos)) {
++            return fail(id, QStringLiteral("cut: item (clip id), position"));
++        }
++        ok = TimelineFunctions::requestClipCut(tl, item, pos);
++        msg = ok ? QStringLiteral("cut") : QStringLiteral("cut position outside the clip");
++    } else if (op == QLatin1String("resize")) {
++        int size = 0;
++        const QString side = req.value(QStringLiteral("side")).toString();
++        if (!intArg(req, "item", 0, 1 << 30, item) || !(tl->isClip(item) || tl->isComposition(item)) || !intArg(req, "length", 1, kMaxFrame, size)
++            || (side != QLatin1String("start") && side != QLatin1String("end"))) {
++            return fail(id, QStringLiteral("resize: item, side start|end, length"));
++        }
++        const int got = tl->requestItemResize(item, size, side == QLatin1String("end"), true);
++        ok = got == size;
++        msg = ok ? QStringLiteral("resized") : QStringLiteral("resize limited to %1 frames").arg(got);
++    } else if (op == QLatin1String("delete")) {
++        if (!intArg(req, "item", 0, 1 << 30, item) || !(tl->isClip(item) || tl->isComposition(item))) {
++            return fail(id, QStringLiteral("delete: item"));
++        }
++        ok = tl->requestItemDeletion(item, true);
++        msg = ok ? QStringLiteral("deleted") : QStringLiteral("delete refused");
++    } else if (op == QLatin1String("insert")) {
++        int pos = 0;
++        const QString bin = req.value(QStringLiteral("bin")).toString();
++        const int tid = trackFromTag(tl, req.value(QStringLiteral("track")).toString());
++        if (bin.isEmpty() || bin.size() > 20 || !pCore->projectItemModel()->getClipByBinID(bin) || tid < 0 || !intArg(req, "position", 0, kMaxFrame, pos)) {
++            return fail(id, QStringLiteral("insert: bin (clip id in the project bin), track, position"));
++        }
++        int newId = -1;
++        ok = tl->requestClipInsertion(bin, tid, pos, newId, true, true, false);
++        msg = ok ? QStringLiteral("inserted %1").arg(newId) : QStringLiteral("insert refused (overlap / locked track?)");
++    } else if (op == QLatin1String("effect")) {
++        const QString effect = req.value(QStringLiteral("effect")).toString();
++        static const QRegularExpression safe(QStringLiteral("^[A-Za-z0-9_.:-]{1,64}$"));
++        if (!intArg(req, "item", 0, 1 << 30, item) || !tl->isClip(item) || !safe.match(effect).hasMatch()) {
++            return fail(id, QStringLiteral("effect: item, effect (Kdenlive effect id)"));
++        }
++        ok = !tl->addClipEffect(item, effect).isEmpty();
++        msg = ok ? QStringLiteral("effect added") : QStringLiteral("unknown effect or not applicable");
++    } else if (op == QLatin1String("seek")) {
++        int pos = 0;
++        if (!intArg(req, "position", 0, kMaxFrame, pos)) {
++            return fail(id, QStringLiteral("seek: position"));
++        }
++        pCore->seekMonitor(Kdenlive::ProjectMonitor, pos);
++        ok = true;
++        msg = QStringLiteral("seek");
++    } else if (op == QLatin1String("save")) {
++        ok = pCore->projectManager()->saveFile();
++        msg = ok ? QStringLiteral("saved") : QStringLiteral("save failed");
++    } else {
++        return fail(id, QStringLiteral("unknown op"));
++    }
++    return QJsonObject{{QStringLiteral("id"), id}, {QStringLiteral("ok"), ok}, {QStringLiteral("msg"), msg}, {QStringLiteral("state"), state()}};
++}
+diff --git a/src/vas/vasbridge.h b/src/vas/vasbridge.h
+new file mode 100644
+index 0000000..91c0d9c
+--- /dev/null
++++ b/src/vas/vasbridge.h
+@@ -0,0 +1,49 @@
++/*
++    SPDX-FileCopyrightText: 2026 Vietnews AI Studio contributors
++    SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++#pragma once
++
++#include <QJsonObject>
++#include <QLocalServer>
++#include <QObject>
++
++class QLocalSocket;
++
++/**
++ * @brief VAS live-control bridge (Vietnews AI Studio).
++ *
++ * Active ONLY when Kdenlive is started by VAS Desk with the environment variables
++ * VAS_KDENLIVE_PIPE (local server name) and VAS_KDENLIVE_TOKEN (random secret for this launch).
++ * Otherwise Kdenlive behaves exactly as upstream.
++ *
++ * Protocol: one compact JSON object per line.
++ *   request  {"token":"…","id":n,"op":"state"|"move"|"cut"|"resize"|"delete"|"insert"|"effect"|"seek"|"save", …}
++ *   response {"id":n,"ok":true|false,"msg":"…","state":{…}}
++ * Security: the server only accepts connections from the same Windows / Unix user (QLocalServer::UserAccessOption,
++ * like RenderServer), every request must carry the launch token, the operation list is fixed and every argument is
++ * type / range checked here AND by VAS Desk before it is sent. No file path, script or expression is ever accepted.
++ * Edits go through the timeline model's own request* functions with logUndo = true, so each AI edit is a normal
++ * undo step the user can revert with Ctrl+Z.
++ */
++class VasBridge : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit VasBridge(QObject *parent = nullptr);
++    ~VasBridge() override;
++    /** @brief True when VAS started this Kdenlive (environment variables present). */
++    static bool enabled();
++
++private Q_SLOTS:
++    void connected();
++    void readSocket();
++
++private:
++    QLocalServer m_server;
++    QByteArray m_token;
++    QJsonObject handle(const QJsonObject &req);
++    QJsonObject state() const;
++};
+-- 
+2.56.1.windows.1
+
