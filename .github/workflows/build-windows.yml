@@ -85,11 +85,13 @@ jobs:
           New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/out" | Out-Null
           Get-ChildItem -Path $pkg -Recurse -Include *.exe, *.7z | Copy-Item -Destination "$env:GITHUB_WORKSPACE/out"
           # repack the .7z without the files listed in craft/exclude-from-package.txt (antivirus false positives, documented there)
-          $excl = @(Get-Content "$env:GITHUB_WORKSPACE/craft/exclude-from-package.txt" | Where-Object { $_.Trim() -and -not $_.StartsWith('#') } | ForEach-Object { $_.Trim().Replace('/', '') })
+          $excl = @(Get-Content "$env:GITHUB_WORKSPACE/craft/exclude-from-package.txt" | Where-Object { $_.Trim() -and -not $_.StartsWith('#') } | ForEach-Object { $_.Trim().Replace('/', [IO.Path]::DirectorySeparatorChar) })
           $orig = Get-ChildItem "$env:GITHUB_WORKSPACE/out/*.7z" | Select-Object -First 1
           $tmp = "C:/repack"
           & 7z x $orig.FullName "-o$tmp" -y | Out-Null; if ($LASTEXITCODE) { exit 1 }
-          foreach ($e in $excl) { $f = Join-Path $tmp $e; if (Test-Path $f) { Remove-Item $f -Force; Write-Host "excluded $e" } else { Write-Host "not present: $e" } }
+          # an entry that is not in the package is an ERROR (run 4: a broken path silently excluded nothing)
+          foreach ($e in $excl) { $f = Join-Path $tmp $e; if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force; Write-Host "excluded $e" } else { Write-Error "exclude entry not found in package: $e"; exit 1 } }
+          foreach ($e in $excl) { if (Test-Path -LiteralPath (Join-Path $tmp $e)) { Write-Error "still present after exclusion: $e"; exit 1 } }
           Remove-Item $orig.FullName
           Push-Location $tmp
           & 7z a -t7z -mx=7 "$env:GITHUB_WORKSPACE/out/kdenlive-vas-$env:GITHUB_RUN_NUMBER-windows-x86_64.7z" * | Out-Null; if ($LASTEXITCODE) { exit 1 }
