@@ -21,7 +21,8 @@ jobs:
       KDENLIVE_TAG: v26.08.2
       # the exact MLT commit KDE Craft builds for Kdenlive (craft-blueprints-kde libs/mlt/mlt.py defaultTarget 7a3319f): ours differs only by patches/mlt
       MLT_COMMIT: 7a3319fc6dbfa2fbf8fe90b5b94344a210ce4f8c
-      CRAFT_TARGET: windows-msvc2022_64-cl
+      # same target as KDE's official Windows release (MinGW); see craft/CraftConfig.ini
+      CRAFT_TARGET: windows-mingw_64-gcc
     steps:
       - uses: actions/checkout@v4
 
@@ -114,7 +115,7 @@ jobs:
           foreach ($e in $excl) { $f = Join-Path $tmp $e; if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force; Write-Host "excluded $e" } else { Write-Error "exclude entry not found in package: $e"; exit 1 } }
           foreach ($e in $excl) { if (Test-Path -LiteralPath (Join-Path $tmp $e)) { Write-Error "still present after exclusion: $e"; exit 1 } }
           # the patched binaries must be the ones built in THIS job, not KDE's cached ones (run 7 shipped the cached, unpatched melt.exe)
-          foreach ($b in "bin/melt.exe", "bin/mlt-7.dll", "bin/kdenlive.exe") {
+          foreach ($b in "bin/melt.exe", "bin/libmlt-7.dll", "bin/kdenlive.exe") {
             $f = Get-Item -LiteralPath (Join-Path $tmp $b) -ErrorAction SilentlyContinue
             if (-not $f) { Write-Error "missing from package: $b"; exit 1 }
             if ($f.LastWriteTime -lt $jobStart) { Write-Error "$b in the package is not from this build ($($f.LastWriteTime) < $jobStart): cached binary"; exit 1 }
