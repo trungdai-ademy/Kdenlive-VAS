@@ -27,14 +27,23 @@ This repository does **not** contain a copy of Kdenlive. It contains:
 
 ## MLT patch (`patches/mlt/0001-melt-windows-exit-without-teardown.patch`)
 
-On Windows, `melt` crashes at exit (access violation in `Qt6Core.dll`, `QSystemLocale::query`) after every render that loaded the Qt
-module (`qtext`, `kdenlivetitle`, ...): the module creates a `QApplication` and never destroys it, and since #1175 melt returns without
-closing services, so the DLL teardown destroys Qt's locale data first. The output is complete and the exit status is 0, but each run
-raises an APPCRASH report and Windows Error Reporting delays the exit by seconds (measured on a real VAS machine: 1,636 crashes in 7 days).
-The patch (Windows only) wraps melt's `main`: on every path out of it (render, `-query`, `-version`, errors) streams are flushed and
-the process ends, skipping the teardown. Output is already complete at that point (a started consumer has been stopped: the avformat
-thread wrote the trailer and closed the file; the xml consumer writes synchronously). To be proposed upstream.
+On Windows, every `melt` render that uses MLT's Qt module (`qtext`, `kdenlivetitle`, ...) raises an access violation in Qt
+(measured on a real VAS machine: 1,636 crash reports in 7 days). The output is complete and the exit status is 0, but Windows Error
+Reporting holds the process for seconds (official melt: 4.6-7 s per render instead of ~1 s).
 
+Where it happens (traced with the Windows debug API, build 12, 2026-11-14): not in melt's own exit, but when `mlt_consumer_stop` joins
+the render threads: a thread that rendered with Qt crashes in Qt's per-thread cleanup while it exits
+(`RtlExitUserThread` -> `LdrShutdownThread` -> Qt6Gui -> Qt6Core next to `QSystemLocale::query`, reading address 0x50), while the
+main thread waits for it.
+
+The patch (Windows only):
+- after `transport()`, when the **avformat** consumer has stopped by itself (it reports stopped only after `av_write_trailer` and
+  closing the output), not interrupted by a signal and not a 2-pass encode, melt ends the process right there instead of joining the
+  render threads;
+- melt's `main` is wrapped so that every other path out of it (`-query`, `-version`, errors, other consumers) also flushes streams and
+  ends the process without the DLL teardown.
+
+To be proposed upstream (a fix inside Qt or the Qt module would cover in-process MLT users too).
 ## Licence
 
 Kdenlive is free software released under the GNU General Public License, version 3 (see `LICENSE`, copied from Kdenlive's

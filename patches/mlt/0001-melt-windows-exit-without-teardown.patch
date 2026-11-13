@@ -1,5 +1,5 @@
 diff --git a/src/melt/melt.c b/src/melt/melt.c
-index 4a0a304..8ba9538 100644
+index 4a0a304..9aa12eb 100644
 --- a/src/melt/melt.c
 +++ b/src/melt/melt.c
 @@ -44,6 +44,13 @@
@@ -28,7 +28,36 @@ index 4a0a304..8ba9538 100644
  {
      int i;
      mlt_consumer consumer = NULL;
-@@ -1157,3 +1168,21 @@ int main(int argc, char **argv)
+@@ -1122,6 +1133,28 @@ int main(int argc, char **argv)
+                 // Transport functionality
+                 transport(melt, consumer);
+ 
++#ifdef _WIN32
++                // The avformat consumer reports "stopped" only after it wrote the trailer and closed the
++                // output (consumer_thread: av_write_trailer, avio_close, then mlt_consumer_stopped). Stopping
++                // the consumer now would join the render threads, and a thread that rendered with the Qt
++                // module (qtext, kdenlivetitle, ...) crashes in Qt's per-thread cleanup when it exits
++                // (LdrShutdownThread -> Qt6Gui -> Qt6Core near QSystemLocale::query, 0xC0000005). The output
++                // is complete and the status stays 0, but every such render raises a crash report and
++                // Windows Error Reporting holds the exiting thread for seconds. Nothing is left to write, so
++                // end the process here. Not for 2-pass encodes (the thread removes its log files after
++                // reporting stopped), not when interrupted by a signal, and only for avformat.
++                {
++                    mlt_properties cprops = MLT_CONSUMER_PROPERTIES(consumer);
++                    const char *cservice = mlt_properties_get(cprops, "mlt_service");
++                    if (!stop_signum && mlt_consumer_is_stopped(consumer) && cservice
++                        && !strcmp(cservice, "avformat") && mlt_properties_get_int(cprops, "pass") <= 1) {
++                        int status = mlt_properties_get_int(cprops, "melt_error");
++                        fflush(NULL);
++                        TerminateProcess(GetCurrentProcess(), (UINT) status);
++                    }
++                }
++#endif
++
+                 // Stop the consumer
+                 mlt_consumer_stop(consumer);
+             }
+@@ -1157,3 +1190,21 @@ int main(int argc, char **argv)
  
      return error;
  }
