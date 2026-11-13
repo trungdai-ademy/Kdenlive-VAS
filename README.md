@@ -9,6 +9,7 @@ This repository does **not** contain a copy of Kdenlive. It contains:
 | Path | What |
 |---|---|
 | `patches/` | Changes on top of the upstream tag `v26.08.2` of https://invent.kde.org/multimedia/kdenlive (applied in order) |
+| `patches/mlt/` | Changes on top of MLT (https://github.com/mltframework/mlt, pinned commit in the workflow) |
 | `craft/CraftConfig.ini` | KDE Craft configuration, adapted from KDE's own CI (`sysadmin/craft-ci`, `qt6/CraftConfig.ini`) |
 | `.github/workflows/build-windows.yml` | Builds the Windows package the same way KDE's CI does (CraftMaster), publishes it as a pre-release |
 
@@ -23,6 +24,14 @@ This repository does **not** contain a copy of Kdenlive. It contains:
   id), `seek`, `save`. Every argument is type- and range-checked; no file path, script or expression is ever accepted. VAS Desk validates
   every AI request again before forwarding it.
 - Edits use the timeline model's `request*` functions with undo logging, so they behave exactly like edits made with the mouse.
+
+## MLT patch (`patches/mlt/0001-melt-windows-exit-without-teardown.patch`)
+
+On Windows, `melt` crashes at exit (access violation in `Qt6Core.dll`, `QSystemLocale::query`) after every render that loaded the Qt
+module (`qtext`, `kdenlivetitle`, ...): the module creates a `QApplication` and never destroys it, and since #1175 melt returns without
+closing services, so the DLL teardown destroys Qt's locale data first. The output is complete and the exit status is 0, but each run
+raises an APPCRASH report and Windows Error Reporting delays the exit by seconds (measured on a real VAS machine: 1,636 crashes in 7 days).
+The patch ends the process right after the consumer is stopped and streams are flushed, skipping the teardown. To be proposed upstream.
 
 ## Licence
 

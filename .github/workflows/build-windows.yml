@@ -19,6 +19,7 @@ jobs:
     env:
       PYTHONUTF8: "1"
       KDENLIVE_TAG: v26.08.2
+      MLT_COMMIT: 2a51ed9cca0b7edca5f1c34749bad67b76b0051a
       CRAFT_TARGET: windows-msvc2022_64-cl
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +38,22 @@ jobs:
             git apply --check $p.FullName; if ($LASTEXITCODE) { Write-Error "patch does not apply: $($p.Name)"; exit 1 }
             git apply $p.FullName
             Write-Host "applied $($p.Name)"
+          }
+          Pop-Location
+
+      - name: MLT source (pinned) + VAS patches
+        shell: pwsh
+        run: |
+          # MLT 7.43.0 development commit matching KDE Craft's MLT for Kdenlive 26.08 (no 7.43 tag yet)
+          git init -q C:/mlt-src
+          Push-Location C:/mlt-src
+          git remote add origin https://github.com/mltframework/mlt.git
+          git fetch -q --depth 1 origin $env:MLT_COMMIT; if ($LASTEXITCODE) { exit 1 }
+          git checkout -q FETCH_HEAD
+          foreach ($p in Get-ChildItem "$env:GITHUB_WORKSPACE/patches/mlt/*.patch" | Sort-Object Name) {
+            git apply --check $p.FullName; if ($LASTEXITCODE) { Write-Error "MLT patch does not apply: $($p.Name)"; exit 1 }
+            git apply $p.FullName
+            Write-Host "applied MLT $($p.Name)"
           }
           Pop-Location
 
@@ -77,6 +94,8 @@ jobs:
             exit $code
           }
           CMRetry -c --install-deps --options "[CodeSigning]Enabled=False" kdenlive
+          # MLT from the pinned, patched source (melt exit crash with the Qt module — patches/mlt/), replacing the cached MLT before Kdenlive builds on it
+          CM -c --no-cache --options "mlt.srcDir=C:/mlt-src" libs/mlt
           CM -c --no-cache --options "kdenlive.srcDir=C:/kdenlive-src" kdenlive
           CMRetry -c -i --update nsis
           CM -c --package --options "kdenlive.srcDir=C:/kdenlive-src" kdenlive
