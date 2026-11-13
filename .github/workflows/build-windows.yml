@@ -51,6 +51,10 @@ jobs:
           git remote add origin https://github.com/mltframework/mlt.git
           git fetch -q --depth 1 origin $env:MLT_COMMIT; if ($LASTEXITCODE) { exit 1 }
           git checkout -q FETCH_HEAD
+          # submodules (glaxnimate module source, pinned by MLT): run 11 failed without them ("glaxnimate/src/core/ is not an existing directory")
+          git submodule update --init --recursive --depth 1
+          if ($LASTEXITCODE) { git submodule update --init --recursive; if ($LASTEXITCODE) { exit 1 } }
+          if (-not (Test-Path src/modules/glaxnimate/glaxnimate/src/core)) { Write-Error "MLT glaxnimate submodule missing"; exit 1 }
           foreach ($p in Get-ChildItem "$env:GITHUB_WORKSPACE/patches/mlt/*.patch" | Sort-Object Name) {
             git apply --check $p.FullName; if ($LASTEXITCODE) { Write-Error "MLT patch does not apply: $($p.Name)"; exit 1 }
             git apply $p.FullName

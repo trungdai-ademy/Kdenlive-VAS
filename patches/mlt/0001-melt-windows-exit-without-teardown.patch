@@ -1,5 +1,5 @@
 diff --git a/src/melt/melt.c b/src/melt/melt.c
-index 4a0a304..28a9e2b 100644
+index 4a0a304..8ba9538 100644
 --- a/src/melt/melt.c
 +++ b/src/melt/melt.c
 @@ -44,6 +44,13 @@
@@ -16,19 +16,37 @@ index 4a0a304..28a9e2b 100644
  static mlt_producer melt = NULL;
  static volatile sig_atomic_t stop_signum = 0;
  
-@@ -1155,5 +1162,15 @@ int main(int argc, char **argv)
-         error = EXIT_FAILURE; // Windows: no re-raise, so surface a non-zero status
-     }
+@@ -764,7 +771,11 @@ static mlt_repository setup_factory(const char *repo_path, int set_locale)
+     return repo;
+ }
  
 +#ifdef _WIN32
-+    // End the process here, skipping the C runtime / DLL teardown. Everything is written at this point:
-+    // the consumer was stopped (trailer written, output closed by its thread) and streams flushed above,
-+    // and melt deliberately does not close services any more (#1175). The teardown only unloads modules;
-+    // with the Qt module loaded (qtext, kdenlivetitle, ...) it crashes in QSystemLocale::query, because
-+    // Qt's locale data is destroyed while the QApplication created by createQApplicationIfNeeded() is
-+    // still alive. The exit status stays correct, but every such run raises an APPCRASH report and
-+    // Windows Error Reporting delays the exit by seconds.
-+    TerminateProcess(GetCurrentProcess(), (UINT) error);
++static int melt_main(int argc, char **argv)
++#else
+ int main(int argc, char **argv)
 +#endif
+ {
+     int i;
+     mlt_consumer consumer = NULL;
+@@ -1157,3 +1168,21 @@ int main(int argc, char **argv)
+ 
      return error;
  }
++
++#ifdef _WIN32
++// End the process right after melt_main(), on EVERY path out of it (render, -query, -version, errors),
++// skipping the C runtime / DLL teardown. Everything is written at this point: a started consumer was
++// stopped (avformat: its thread wrote the trailer and closed the output; xml: written synchronously)
++// and C streams are flushed here; melt deliberately does not close services any more (#1175). The
++// teardown only unloads modules; with the Qt module loaded (qtext, kdenlivetitle, ...) it crashes in
++// QSystemLocale::query, because Qt's locale data is destroyed while the QApplication created by
++// createQApplicationIfNeeded() is still alive. The exit status stays correct, but every such run raises
++// an APPCRASH report and Windows Error Reporting delays the exit by seconds.
++int main(int argc, char **argv)
++{
++    int error = melt_main(argc, argv);
++    fflush(NULL);
++    TerminateProcess(GetCurrentProcess(), (UINT) error);
++    return error;
++}
++#endif

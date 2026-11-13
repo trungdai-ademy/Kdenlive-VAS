@@ -31,7 +31,9 @@ On Windows, `melt` crashes at exit (access violation in `Qt6Core.dll`, `QSystemL
 module (`qtext`, `kdenlivetitle`, ...): the module creates a `QApplication` and never destroys it, and since #1175 melt returns without
 closing services, so the DLL teardown destroys Qt's locale data first. The output is complete and the exit status is 0, but each run
 raises an APPCRASH report and Windows Error Reporting delays the exit by seconds (measured on a real VAS machine: 1,636 crashes in 7 days).
-The patch ends the process right after the consumer is stopped and streams are flushed, skipping the teardown. To be proposed upstream.
+The patch (Windows only) wraps melt's `main`: on every path out of it (render, `-query`, `-version`, errors) streams are flushed and
+the process ends, skipping the teardown. Output is already complete at that point (a started consumer has been stopped: the avformat
+thread wrote the trailer and closed the file; the xml consumer writes synchronously). To be proposed upstream.
 
 ## Licence
 
