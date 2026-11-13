@@ -9,7 +9,7 @@ This repository does **not** contain a copy of Kdenlive. It contains:
 | Path | What |
 |---|---|
 | `patches/` | Changes on top of the upstream tag `v26.08.2` of https://invent.kde.org/multimedia/kdenlive (applied in order) |
-| `patches/mlt/` | Changes on top of MLT (https://github.com/mltframework/mlt, pinned commit in the workflow) |
+| `patches/mlt/` | Changes on top of MLT (https://github.com/mltframework/mlt), at the exact commit KDE Craft builds for Kdenlive (`7a3319f`, pinned in the workflow) |
 | `craft/CraftConfig.ini` | KDE Craft configuration, adapted from KDE's own CI (`sysadmin/craft-ci`, `qt6/CraftConfig.ini`) |
 | `.github/workflows/build-windows.yml` | Builds the Windows package the same way KDE's CI does (CraftMaster), publishes it as a pre-release |
 
@@ -36,8 +36,10 @@ The patch ends the process right after the consumer is stopped and streams are f
 ## Licence
 
 Kdenlive is free software released under the GNU General Public License, version 3 (see `LICENSE`, copied from Kdenlive's
-`LICENSES/GPL-3.0-only.txt`). The patches in this repository are released under the same terms
-(`GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL`, as upstream). Binaries built by the workflow are built from the upstream tag plus these
+`LICENSES/GPL-3.0-only.txt`). The Kdenlive patches in this repository are released under the same terms
+(`GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL`, as upstream). MLT is released under the GNU LGPL 2.1 (framework, modules) and the
+melt command-line program (`src/melt/`) under the GNU GPL 2.0 or later; the MLT patch changes `src/melt/melt.c` only and is released under
+the GPL 2.0 or later, as that file. Binaries built by the workflow are built from the upstream tag plus these
 patches only; the exact commit of this repository is recorded in each release.
 
 Kdenlive is a trademark of KDE e.V.; this is an unofficial build and is not endorsed by the Kdenlive team. Bugs found with this build should

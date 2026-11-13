@@ -19,7 +19,8 @@ jobs:
     env:
       PYTHONUTF8: "1"
       KDENLIVE_TAG: v26.08.2
-      MLT_COMMIT: 2a51ed9cca0b7edca5f1c34749bad67b76b0051a
+      # the exact MLT commit KDE Craft builds for Kdenlive (craft-blueprints-kde libs/mlt/mlt.py defaultTarget 7a3319f): ours differs only by patches/mlt
+      MLT_COMMIT: 7a3319fc6dbfa2fbf8fe90b5b94344a210ce4f8c
       CRAFT_TARGET: windows-msvc2022_64-cl
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +45,6 @@ jobs:
       - name: MLT source (pinned) + VAS patches
         shell: pwsh
         run: |
-          # MLT 7.43.0 development commit matching KDE Craft's MLT for Kdenlive 26.08 (no 7.43 tag yet)
           git init -q C:/mlt-src
           Push-Location C:/mlt-src
           git remote add origin https://github.com/mltframework/mlt.git
@@ -69,6 +69,7 @@ jobs:
         shell: pwsh
         run: |
           Set-Location C:/Craft
+          $jobStart = Get-Date
           New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/logs" | Out-Null
           $log = "$env:GITHUB_WORKSPACE/logs/build.log"
           # full output kept in logs/build.log (published on failure); the console shows each step's tail
@@ -94,11 +95,11 @@ jobs:
             exit $code
           }
           CMRetry -c --install-deps --options "[CodeSigning]Enabled=False" kdenlive
-          # MLT from the pinned, patched source (melt exit crash with the Qt module — patches/mlt/), replacing the cached MLT before Kdenlive builds on it
-          CM -c --no-cache --options "mlt.srcDir=C:/mlt-src" libs/mlt
-          CM -c --no-cache --options "kdenlive.srcDir=C:/kdenlive-src" kdenlive
+          # MLT and Kdenlive from the patched sources (srcDir set in craft/CraftConfig.ini, so every later step sees the same versions)
+          CM -c --no-cache libs/mlt
+          CM -c --no-cache kdenlive
           CMRetry -c -i --update nsis
-          CM -c --package --options "kdenlive.srcDir=C:/kdenlive-src" kdenlive
+          CM -c --package kdenlive
           $pkg = (python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET -c -q --get "packageDestinationDir()" virtual/base | Select-Object -Last 1).Trim()
           Write-Host "package dir: $pkg"
           New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/out" | Out-Null
@@ -111,6 +112,13 @@ jobs:
           # an entry that is not in the package is an ERROR (run 4: a broken path silently excluded nothing)
           foreach ($e in $excl) { $f = Join-Path $tmp $e; if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force; Write-Host "excluded $e" } else { Write-Error "exclude entry not found in package: $e"; exit 1 } }
           foreach ($e in $excl) { if (Test-Path -LiteralPath (Join-Path $tmp $e)) { Write-Error "still present after exclusion: $e"; exit 1 } }
+          # the patched binaries must be the ones built in THIS job, not KDE's cached ones (run 7 shipped the cached, unpatched melt.exe)
+          foreach ($b in "bin/melt.exe", "bin/mlt-7.dll", "bin/kdenlive.exe") {
+            $f = Get-Item -LiteralPath (Join-Path $tmp $b) -ErrorAction SilentlyContinue
+            if (-not $f) { Write-Error "missing from package: $b"; exit 1 }
+            if ($f.LastWriteTime -lt $jobStart) { Write-Error "$b in the package is not from this build ($($f.LastWriteTime) < $jobStart): cached binary"; exit 1 }
+            Write-Host "built in this job: $b $($f.LastWriteTime)"
+          }
           Remove-Item $orig.FullName
           Push-Location $tmp
           & 7z a -t7z -mx=7 "$env:GITHUB_WORKSPACE/out/kdenlive-vas-$env:GITHUB_RUN_NUMBER-windows-x86_64.7z" * | Out-Null; if ($LASTEXITCODE) { exit 1 }
@@ -125,7 +133,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $notes = "Kdenlive $env:KDENLIVE_TAG + VAS patches ($env:GITHUB_SHA). Unsigned test build - verify SHA256SUMS.txt. The .7z omits the files listed in craft/exclude-from-package.txt (antivirus false positives); the .exe installer is Craft's original output. Source: upstream tag + patches/ in this repository (GPL-3.0)."
-          gh release create "build-$env:GITHUB_RUN_NUMBER" (Get-ChildItem "$env:GITHUB_WORKSPACE/out").FullName --prerelease --title "Kdenlive VAS build $env:GITHUB_RUN_NUMBER" --notes $notes --target $env:GITHUB_SHA
+          # build log attached too (run 7: the package silently used cached MLT and there was no log to see why)
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE/logs/build.log" -DestinationPath "$env:GITHUB_WORKSPACE/build-log.zip" -Force
+          gh release create "build-$env:GITHUB_RUN_NUMBER" @((Get-ChildItem "$env:GITHUB_WORKSPACE/out").FullName) "$env:GITHUB_WORKSPACE/build-log.zip" --prerelease --title "Kdenlive VAS build $env:GITHUB_RUN_NUMBER" --notes $notes --target $env:GITHUB_SHA
 
       - name: Publish logs on failure
         if: failure()
