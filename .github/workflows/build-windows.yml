@@ -96,7 +96,8 @@ jobs:
           }
           CMRetry -c --install-deps --options "[CodeSigning]Enabled=False" kdenlive
           # MLT and Kdenlive from the patched sources (srcDir set in craft/CraftConfig.ini, so every later step sees the same versions)
-          CM -c --no-cache libs/mlt
+          # -i: install over the cached MLT of the same version (run 8: "libs/mlt is up to date, nothing to do" -> cached melt shipped)
+          CM -c --no-cache -i libs/mlt
           CM -c --no-cache kdenlive
           CMRetry -c -i --update nsis
           CM -c --package kdenlive
