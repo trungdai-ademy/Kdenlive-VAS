@@ -1,0 +1,156 @@
+From 964a55edb701d6e8186c06bc968839ba2f304653 Mon Sep 17 00:00:00 2001
+From: Vietnews AI Studio <noreply@vietnews.invalid>
+Date: Fri, 13 Nov 2026 22:37:11 +1000
+Subject: [PATCH] VAS bridge: no reads or edits while a project is
+ opening/closing; no nested handling; guard the socket
+
+Kdenlive runs nested event loops (qApp->processEvents) while it opens a project. A request arriving
+then was handled against a half-built timeline model, and when the caller had timed out and
+disconnected meanwhile, the socket was deleted under the handler; both crashed Kdenlive
+(0xC0000005, same address every time, in the live test). Now:
+- state() reports open=false, busy=true and edits are refused while KdenliveDoc::isBusy()
+  (loading or closing) or the application is closing; the caller polls again;
+- a request arriving inside a nested event loop waits until the current one has finished;
+- the socket is held by QPointer and nothing is written once the caller has gone.
+---
+ src/vas/vasbridge.cpp | 50 ++++++++++++++++++++++++++++++++++++-------
+ src/vas/vasbridge.h   | 10 ++++++++-
+ 2 files changed, 51 insertions(+), 9 deletions(-)
+
+diff --git a/src/vas/vasbridge.cpp b/src/vas/vasbridge.cpp
+index 1db4137..0d2879a 100644
+--- a/src/vas/vasbridge.cpp
++++ b/src/vas/vasbridge.cpp
+@@ -19,6 +19,7 @@
+ #include <QJsonDocument>
+ #include <QLocalSocket>
+ #include <QRegularExpression>
++#include <QTimer>
+ 
+ #include <algorithm>
+ #include <unordered_set>
+@@ -121,18 +122,40 @@ VasBridge::~VasBridge() = default;
+ void VasBridge::connected()
+ {
+     while (QLocalSocket *socket = m_server.nextPendingConnection()) {
+-        connect(socket, &QLocalSocket::readyRead, this, &VasBridge::readSocket);
++        m_sockets.removeIf([](const QPointer<QLocalSocket> &p) { return p.isNull(); });
++        m_sockets.append(socket);
++        connect(socket, &QLocalSocket::readyRead, this, [this, socket]() { process(socket); });
+         connect(socket, &QLocalSocket::disconnected, socket, &QObject::deleteLater);
+     }
+ }
+ 
+-void VasBridge::readSocket()
++void VasBridge::drain()
+ {
+-    auto *socket = qobject_cast<QLocalSocket *>(sender());
+-    if (!socket) {
++    m_sockets.removeIf([](const QPointer<QLocalSocket> &p) { return p.isNull(); });
++    const auto sockets = m_sockets;
++    for (const auto &s : sockets) {
++        if (s && s->canReadLine()) {
++            process(s);
++        }
++    }
++}
++
++void VasBridge::process(QLocalSocket *raw)
++{
++    // The socket can be deleted while a request is handled (the caller timed out and disconnected while Kdenlive was
++    // busy, deleteLater ran in a nested event loop): never touch it again without checking (0xC0000005 in the live test).
++    QPointer<QLocalSocket> socket(raw);
++    if (m_busy) {
++        // nested event loop inside a request: the data stays buffered, answered once the current request is done
++        QTimer::singleShot(50, this, &VasBridge::drain);
+         return;
+     }
+-    while (socket->canReadLine()) {
++    m_busy = true;
++    struct Release {
++        bool &b;
++        ~Release() { b = false; }
++    } release{m_busy};
++    while (socket && socket->state() == QLocalSocket::ConnectedState && socket->canReadLine()) {
+         const QByteArray line = socket->readLine(kMaxLine + 1);
+         if (line.size() > kMaxLine) {
+             socket->abort();
+@@ -152,10 +175,14 @@ void VasBridge::readSocket()
+             }
+             reply = handle(req);
+         }
++        if (!socket || socket->state() != QLocalSocket::ConnectedState) {
++            // the caller went away while the request was handled: nothing to answer
++            return;
++        }
+         socket->write(QJsonDocument(reply).toJson(QJsonDocument::Compact) + '\n');
+         socket->flush();
+     }
+-    if (socket->bytesAvailable() > kMaxLine) {
++    if (socket && socket->bytesAvailable() > kMaxLine) {
+         socket->abort();
+     }
+ }
+@@ -165,9 +192,11 @@ QJsonObject VasBridge::state() const
+     QJsonObject st;
+     auto tl = timeline();
+     KdenliveDoc *doc = pCore ? pCore->currentDoc() : nullptr;
+-    // no answer while a project is still being opened (no document yet): the caller polls again
+-    if (!tl || !doc) {
++    // nothing is read while a project is being opened or closed: the model is half built, and Kdenlive runs nested event
++    // loops during loading (qApp->processEvents) — reading it then crashed Kdenlive. The caller polls again.
++    if (!tl || !doc || doc->isBusy() || pCore->closing) {
+         st.insert(QStringLiteral("open"), false);
++        st.insert(QStringLiteral("busy"), doc != nullptr);
+         return st;
+     }
+     st.insert(QStringLiteral("open"), true);
+@@ -240,6 +269,11 @@ QJsonObject VasBridge::handle(const QJsonObject &req)
+     if (!tl) {
+         return fail(id, QStringLiteral("no timeline open"));
+     }
++    if (!pCore->currentDoc() || pCore->currentDoc()->isBusy() || pCore->closing) {
++        QJsonObject busy = fail(id, QStringLiteral("busy: the project is being opened or closed, try again"));
++        busy.insert(QStringLiteral("busy"), true);
++        return busy;
++    }
+     bool ok = false;
+     QString msg;
+     int item = -1;
+diff --git a/src/vas/vasbridge.h b/src/vas/vasbridge.h
+index 91c0d9c..e8b0577 100644
+--- a/src/vas/vasbridge.h
++++ b/src/vas/vasbridge.h
+@@ -6,8 +6,10 @@
+ #pragma once
+ 
+ #include <QJsonObject>
++#include <QList>
+ #include <QLocalServer>
+ #include <QObject>
++#include <QPointer>
+ 
+ class QLocalSocket;
+ 
+@@ -39,11 +41,17 @@ public:
+ 
+ private Q_SLOTS:
+     void connected();
+-    void readSocket();
++    /** @brief Answer requests waiting on any connection (after a request deferred by m_busy). */
++    void drain();
+ 
+ private:
+     QLocalServer m_server;
+     QByteArray m_token;
++    QList<QPointer<QLocalSocket>> m_sockets;
++    /** Kdenlive runs nested event loops (qApp->processEvents while opening a project, building clips...): a request
++     *  arriving inside one must wait until the request being handled further up the stack has finished. */
++    bool m_busy{false};
++    void process(QLocalSocket *socket);
+     QJsonObject handle(const QJsonObject &req);
+     QJsonObject state() const;
+ };
+-- 
+2.56.1.windows.1
+

@@ -135,7 +135,11 @@ jobs:
           $notes = "Kdenlive $env:KDENLIVE_TAG + VAS patches ($env:GITHUB_SHA). Unsigned test build - verify SHA256SUMS.txt. The .7z omits the files listed in craft/exclude-from-package.txt (antivirus false positives); the .exe installer is Craft's original output. Source: upstream tag + patches/ in this repository (GPL-3.0)."
           # build log attached too (run 7: the package silently used cached MLT and there was no log to see why)
           Compress-Archive -Path "$env:GITHUB_WORKSPACE/logs/build.log" -DestinationPath "$env:GITHUB_WORKSPACE/build-log.zip" -Force
-          gh release create "build-$env:GITHUB_RUN_NUMBER" @((Get-ChildItem "$env:GITHUB_WORKSPACE/out").FullName) "$env:GITHUB_WORKSPACE/build-log.zip" --prerelease --title "Kdenlive VAS build $env:GITHUB_RUN_NUMBER" --notes $notes --target $env:GITHUB_SHA
+          $extra = @("$env:GITHUB_WORKSPACE/build-log.zip")
+          # debug symbols of kdenlive.exe (best effort): turn a crash offset from the Windows event log into a function name
+          $pdb = Get-ChildItem "C:/Craft/$env:CRAFT_TARGET/build" -Recurse -Filter kdenlive.pdb -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 1
+          if ($pdb) { Compress-Archive -Path $pdb.FullName -DestinationPath "$env:GITHUB_WORKSPACE/kdenlive-pdb.zip" -Force; $extra += "$env:GITHUB_WORKSPACE/kdenlive-pdb.zip"; Write-Host "pdb: $($pdb.FullName)" } else { Write-Host "no kdenlive.pdb found" }
+          gh release create "build-$env:GITHUB_RUN_NUMBER" @((Get-ChildItem "$env:GITHUB_WORKSPACE/out").FullName) @extra --prerelease --title "Kdenlive VAS build $env:GITHUB_RUN_NUMBER" --notes $notes --target $env:GITHUB_SHA
 
       - name: Publish logs on failure
         if: failure()
