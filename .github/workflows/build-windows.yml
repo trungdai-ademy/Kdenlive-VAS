@@ -101,6 +101,11 @@ jobs:
           }
           CMRetry -c --install-deps --options "[CodeSigning]Enabled=False" kdenlive
           # MLT and Kdenlive from the patched sources (srcDir set in craft/CraftConfig.ini, so every later step sees the same versions)
+          # KDE's MinGW binary cache is out of sync: the cached libFLAC, libsndfile and sox import ogg.dll, the cached libogg provides libogg-0.dll
+          # (build 12: the MLT sox module did not load, sox audio effects silently missing). Rebuild them against the installed libogg, before MLT.
+          CM -c --no-cache -i libs/libflac
+          CM -c --no-cache -i libs/libsndfile
+          CM -c --no-cache -i libs/sox
           # -i: install over the cached MLT of the same version (run 8: "libs/mlt is up to date, nothing to do" -> cached melt shipped)
           CM -c --no-cache -i libs/mlt
           CM -c --no-cache kdenlive
@@ -125,6 +130,9 @@ jobs:
             if ($f.LastWriteTime -lt $jobStart) { Write-Error "$b in the package is not from this build ($($f.LastWriteTime) < $jobStart): cached binary"; exit 1 }
             Write-Host "built in this job: $b $($f.LastWriteTime)"
           }
+          # every exe / dll in the package must find its imports in the package or in Windows (build 12: ogg.dll missing -> sox module not loaded)
+          & "$env:GITHUB_WORKSPACE/craft/check-imports.ps1" -Root $tmp
+          if ($LASTEXITCODE) { Write-Error "package has unresolved DLL imports (see above)"; exit 1 }
           Remove-Item $orig.FullName
           Push-Location $tmp
           & 7z a -t7z -mx=7 "$env:GITHUB_WORKSPACE/out/kdenlive-vas-$env:GITHUB_RUN_NUMBER-windows-x86_64.7z" * | Out-Null; if ($LASTEXITCODE) { exit 1 }
