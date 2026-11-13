@@ -64,9 +64,21 @@ jobs:
           }
           CM --setup
           CM -c -i --options virtual.ignored=True --update craft
-          CM -c --install-deps --options "[CodeSigning]Enabled=False" kdenlive
+          # downloads (MSYS2 mirrors, KDE cache) sometimes stall (run 2: "Operation too slow" on an MSYS2 mirror) -> retry the network-heavy steps
+          function CMRetry {
+            for ($i = 1; $i -le 3; $i++) {
+              "===== CraftMaster (attempt $i) $args" | Add-Content $log
+              python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET @args *>> $log
+              $code = $LASTEXITCODE
+              Get-Content $log -Tail 15
+              if ($code -eq 0) { return }
+              Start-Sleep -Seconds 60
+            }
+            exit $code
+          }
+          CMRetry -c --install-deps --options "[CodeSigning]Enabled=False" kdenlive
           CM -c --no-cache --options "kdenlive.srcDir=C:/kdenlive-src" kdenlive
-          CM -c -i --update nsis
+          CMRetry -c -i --update nsis
           CM -c --package --options "kdenlive.srcDir=C:/kdenlive-src" kdenlive
           $pkg = (python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET -c -q --get "packageDestinationDir()" virtual/base | Select-Object -Last 1).Trim()
           Write-Host "package dir: $pkg"
