@@ -67,7 +67,10 @@ jobs:
           $ver = (python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET -c -q --get "version" glaxnimate | Select-Object -Last 1).Trim()
           if ($ver -ne $env:GLAXNIMATE_VERSION) { Write-Error "glaxnimate blueprint version $ver != pinned $env:GLAXNIMATE_VERSION"; exit 1 }
           # FFmpeg without --enable-nonfree (see build-windows.yml): same version and ABI, redistributable GPL v3
-          $ffbp = "C:/Craft/etc/blueprints/locations/craft-blueprints-kde/libs/ffmpeg/ffmpeg.py"
+          # blueprint location follows Blueprints/BlueprintRoot in craft/CraftConfig.ini (C:/Craft/blueprints) - find it, exactly one (run 16: wrong fixed path)
+          $ffbp = @(Get-ChildItem C:/Craft -Recurse -Filter ffmpeg.py -ErrorAction SilentlyContinue | Where-Object { $_.FullName.Replace('\', '/') -like '*/craft-blueprints-kde/libs/ffmpeg/ffmpeg.py' })
+          if ($ffbp.Count -ne 1) { Write-Error "ffmpeg blueprint: found $($ffbp.Count) (expected 1): $($ffbp.FullName -join ', ')"; exit 1 }
+          $ffbp = $ffbp[0].FullName; Write-Host "ffmpeg blueprint: $ffbp"
           $ff = Get-Content $ffbp -Raw
           if (([regex]::Matches($ff, '"--enable-nonfree",')).Count -ne 1) { Write-Error "ffmpeg blueprint: expected exactly one --enable-nonfree"; exit 1 }
           Set-Content $ffbp ($ff -replace '\s*"--enable-nonfree",', '') -NoNewline
