@@ -1,5 +1,6 @@
-# Build UNPATCHED Kdenlive (upstream tag, MLT at the blueprint commit) for Windows with KDE Craft - VAS's fallback "official Kdenlive" (switch in
-# VAS Settings). Rebuilt by us because KDE's own binary ships FFmpeg configured with --enable-nonfree ("nonfree and unredistributable").
+# Build Kdenlive WITHOUT VAS's Kdenlive patches (upstream tag; no AI bridge) for Windows with KDE Craft - VAS's fallback "official Kdenlive"
+# (switch in VAS Settings). MLT carries only the crash fixes of patches/mlt (melt exit crash, Glaxnimate render race - upstream-2 golden:
+# Kdenlive render of a Lottie timeline crashed 0xC0000374 exactly like KDE's binary; both fixes are pure bug fixes, proposed upstream). Rebuilt by us because KDE's own binary ships FFmpeg configured with --enable-nonfree ("nonfree and unredistributable").
 # (invent.kde.org/sysadmin/craft-ci gitlab-templates/blocks/windows-base.yml). Result (or the Craft logs on failure) is published as a
 # GitHub pre-release so it can be downloaded without credentials and then verified by VAS's safety gate before use.
 name: build-kdenlive-upstream
@@ -7,7 +8,7 @@ name: build-kdenlive-upstream
 on:
   push:
     branches: [main]
-    paths: ["craft/**", ".github/workflows/build-kdenlive-upstream.yml"]
+    paths: ["craft/**", "patches/mlt/**", ".github/workflows/build-kdenlive-upstream.yml"]
   workflow_dispatch:
 
 permissions:
@@ -20,7 +21,7 @@ jobs:
     env:
       PYTHONUTF8: "1"
       KDENLIVE_TAG: v26.08.2
-      # the exact MLT commit KDE Craft builds for Kdenlive (craft-blueprints-kde libs/mlt/mlt.py defaultTarget 7a3319f), built unpatched
+      # the exact MLT commit KDE Craft builds for Kdenlive (craft-blueprints-kde libs/mlt/mlt.py defaultTarget 7a3319f) + crash fixes from patches/mlt
       MLT_COMMIT: 7a3319fc6dbfa2fbf8fe90b5b94344a210ce4f8c
       # same target as KDE's official Windows release (MinGW); see craft/CraftConfig.ini
       CRAFT_TARGET: windows-mingw_64-gcc
@@ -37,7 +38,7 @@ jobs:
           git clone --depth 1 --branch $env:KDENLIVE_TAG https://invent.kde.org/multimedia/kdenlive.git C:/kdenlive-src
           if ($LASTEXITCODE) { exit 1 }
 
-      - name: MLT source (pinned, no patches)
+      - name: MLT source (pinned) + MLT crash fixes
         shell: pwsh
         run: |
           git init -q C:/mlt-src
@@ -49,6 +50,11 @@ jobs:
           git submodule update --init --recursive --depth 1
           if ($LASTEXITCODE) { git submodule update --init --recursive; if ($LASTEXITCODE) { exit 1 } }
           if (-not (Test-Path src/modules/glaxnimate/glaxnimate/src/core)) { Write-Error "MLT glaxnimate submodule missing"; exit 1 }
+          foreach ($p in Get-ChildItem "$env:GITHUB_WORKSPACE/patches/mlt/*.patch" | Sort-Object Name) {
+            git apply --check $p.FullName; if ($LASTEXITCODE) { Write-Error "MLT patch does not apply: $($p.Name)"; exit 1 }
+            git apply $p.FullName
+            Write-Host "applied MLT $($p.Name)"
+          }
           Pop-Location
 
       - name: Craft tooling
@@ -152,14 +158,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $notes = "Kdenlive $env:KDENLIVE_TAG WITHOUT VAS patches, MLT $env:MLT_COMMIT ($env:GITHUB_SHA). FFmpeg built without --enable-nonfree (GPL v3, redistributable). Unsigned test build - verify SHA256SUMS.txt. The .7z omits the files listed in craft/exclude-from-package.txt (antivirus false positives). Source: upstream tag + this workflow + craft/ (GPL-3.0); build-log.zip lists every Craft package."
+          $notes = "Kdenlive $env:KDENLIVE_TAG WITHOUT VAS Kdenlive patches (no AI bridge), MLT $env:MLT_COMMIT + crash fixes patches/mlt ($env:GITHUB_SHA). FFmpeg built without --enable-nonfree (GPL v3, redistributable). Unsigned test build - verify SHA256SUMS.txt. The .7z omits the files listed in craft/exclude-from-package.txt (antivirus false positives). Source: upstream tag + this workflow + craft/ (GPL-3.0); build-log.zip lists every Craft package."
           # build log attached too (run 7: the package silently used cached MLT and there was no log to see why)
           Compress-Archive -Path "$env:GITHUB_WORKSPACE/logs/build.log" -DestinationPath "$env:GITHUB_WORKSPACE/build-log.zip" -Force
           $extra = @("$env:GITHUB_WORKSPACE/build-log.zip")
           # debug symbols of kdenlive.exe (best effort): turn a crash offset from the Windows event log into a function name
           $pdb = Get-ChildItem "C:/Craft/$env:CRAFT_TARGET/build" -Recurse -Filter kdenlive.pdb -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 1
           if ($pdb) { Compress-Archive -Path $pdb.FullName -DestinationPath "$env:GITHUB_WORKSPACE/kdenlive-pdb.zip" -Force; $extra += "$env:GITHUB_WORKSPACE/kdenlive-pdb.zip"; Write-Host "pdb: $($pdb.FullName)" } else { Write-Host "no kdenlive.pdb found" }
-          gh release create "upstream-$env:GITHUB_RUN_NUMBER" @((Get-ChildItem "$env:GITHUB_WORKSPACE/out").FullName) @extra --prerelease --title "Kdenlive upstream (no VAS patches) build $env:GITHUB_RUN_NUMBER" --notes $notes --target $env:GITHUB_SHA
+          gh release create "upstream-$env:GITHUB_RUN_NUMBER" @((Get-ChildItem "$env:GITHUB_WORKSPACE/out").FullName) @extra --prerelease --title "Kdenlive upstream (no VAS Kdenlive patches; MLT crash fixes) build $env:GITHUB_RUN_NUMBER" --notes $notes --target $env:GITHUB_SHA
 
       - name: Publish logs on failure
         if: failure()
