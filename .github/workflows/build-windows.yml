@@ -6,7 +6,7 @@ name: build-windows
 on:
   push:
     branches: [main]
-    paths: ["patches/**", "craft/**", ".github/workflows/**"]
+    paths: ["patches/**", "craft/**", ".github/workflows/build-windows.yml"]
   workflow_dispatch:
 
 permissions:
