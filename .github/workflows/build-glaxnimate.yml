@@ -1,0 +1,123 @@
+# Build Glaxnimate (KDE Craft blueprint, MSVC 2022 like KDE's standalone release) for Windows - VAS bundles it for users to edit Lottie graphics.
+# Rebuilt by us because KDE's own binary ships FFmpeg configured with --enable-nonfree ("nonfree and unredistributable"); everything else is
+# KDE's Craft cache, recorded in build-log.zip. Published as a GitHub pre-release; VAS's safety gate verifies it before use.
+name: build-glaxnimate
+
+on:
+  push:
+    branches: [main]
+    paths: ["craft/**", ".github/workflows/build-glaxnimate.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    env:
+      PYTHONUTF8: "1"
+      GLAXNIMATE_VERSION: "0.6.0"
+      CRAFT_TARGET: windows-msvc2022_64-cl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Craft tooling
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force C:/Craft | Out-Null
+          git clone --depth 1 https://invent.kde.org/packaging/craftmaster.git C:/Craft/craftmaster
+          $py = (Split-Path (Get-Command python).Source).Replace('\', '/')
+          # Kdenlive / MLT srcDir overrides do not apply here (Glaxnimate uses the blueprint's release tarball)
+          (Get-Content "$env:GITHUB_WORKSPACE/craft/CraftConfig.ini" -Raw).Replace('@PYTHON_DIR@', $py) -replace '(?m)^(libs/mlt\.srcDir|kde/kdemultimedia/kdenlive\.srcDir).*$', '' | Set-Content C:/Craft/CraftConfig.ini -Encoding utf8
+
+      - name: Build and package
+        shell: pwsh
+        run: |
+          Set-Location C:/Craft
+          $jobStart = Get-Date
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/logs" | Out-Null
+          $log = "$env:GITHUB_WORKSPACE/logs/build.log"
+          function CM {
+            "===== CraftMaster $args" | Add-Content $log
+            python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET @args *>> $log
+            $code = $LASTEXITCODE
+            Get-Content $log -Tail 25
+            if ($code -ne 0) { exit $code }
+          }
+          function CMRetry {
+            for ($i = 1; $i -le 3; $i++) {
+              "===== CraftMaster (attempt $i) $args" | Add-Content $log
+              python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET @args *>> $log
+              $code = $LASTEXITCODE
+              Get-Content $log -Tail 15
+              if ($code -eq 0) { return }
+              Start-Sleep -Seconds 60
+            }
+            exit $code
+          }
+          CM --setup
+          CM -c -i --options virtual.ignored=True --update craft
+          CMRetry -c --install-deps --options "[CodeSigning]Enabled=False" glaxnimate
+          $ver = (python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET -c -q --get "version" glaxnimate | Select-Object -Last 1).Trim()
+          if ($ver -ne $env:GLAXNIMATE_VERSION) { Write-Error "glaxnimate blueprint version $ver != pinned $env:GLAXNIMATE_VERSION"; exit 1 }
+          # FFmpeg without --enable-nonfree (see build-windows.yml): same version and ABI, redistributable GPL v3
+          $ffbp = "C:/Craft/etc/blueprints/locations/craft-blueprints-kde/libs/ffmpeg/ffmpeg.py"
+          $ff = Get-Content $ffbp -Raw
+          if (([regex]::Matches($ff, '"--enable-nonfree",')).Count -ne 1) { Write-Error "ffmpeg blueprint: expected exactly one --enable-nonfree"; exit 1 }
+          Set-Content $ffbp ($ff -replace '\s*"--enable-nonfree",', '') -NoNewline
+          CM -c --no-cache -i libs/ffmpeg
+          CM -c --no-cache glaxnimate
+          CMRetry -c -i --update nsis
+          CM -c --package glaxnimate
+          $pkg = (python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET -c -q --get "packageDestinationDir()" virtual/base | Select-Object -Last 1).Trim()
+          Write-Host "package dir: $pkg"
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/out" | Out-Null
+          $orig = Get-ChildItem -Path $pkg -Recurse -Include *.7z | Select-Object -First 1
+          if (-not $orig) { Write-Error "no .7z package produced"; exit 1 }
+          $tmp = "C:/repack"
+          & 7z x $orig.FullName "-o$tmp" -y | Out-Null; if ($LASTEXITCODE) { exit 1 }
+          $exe = Get-ChildItem $tmp -Recurse -Filter glaxnimate.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "glaxnimate.exe missing from package"; exit 1 }
+          if ($exe.LastWriteTime -lt $jobStart) { Write-Error "glaxnimate.exe is not from this build (cached binary)"; exit 1 }
+          foreach ($f in Get-ChildItem $tmp -Recurse -Filter "av*.dll") {
+            $t = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($f.FullName))
+            if ($t.Contains("nonfree and unredistributable")) { Write-Error "$($f.Name): FFmpeg built with --enable-nonfree (not redistributable)"; exit 1 }
+            if ($f.Name -like "avcodec*" -and -not $t.Contains("license: GPL version 3 or later")) { Write-Error "$($f.Name): unexpected FFmpeg licence"; exit 1 }
+            if ($f.Name -like "avcodec*" -and $f.LastWriteTime -lt $jobStart) { Write-Error "$($f.Name) is not from this build (cached FFmpeg)"; exit 1 }
+          }
+          Write-Host "FFmpeg licence: GPL version 3 or later (redistributable)"
+          & "$env:GITHUB_WORKSPACE/craft/check-imports.ps1" -Root $tmp
+          if ($LASTEXITCODE) { Write-Error "package has unresolved DLL imports (see above)"; exit 1 }
+          Push-Location $tmp
+          & 7z a -t7z -mx=7 "$env:GITHUB_WORKSPACE/out/glaxnimate-$env:GLAXNIMATE_VERSION-vas-$env:GITHUB_RUN_NUMBER-windows-x86_64.7z" * | Out-Null; if ($LASTEXITCODE) { exit 1 }
+          Pop-Location
+          Get-ChildItem "$env:GITHUB_WORKSPACE/out" | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content "$env:GITHUB_WORKSPACE/out/SHA256SUMS.txt" -Encoding ascii
+          Get-ChildItem "$env:GITHUB_WORKSPACE/out"
+
+      - name: Publish build
+        if: success()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = "Glaxnimate $env:GLAXNIMATE_VERSION built with KDE Craft (MSVC 2022), FFmpeg without --enable-nonfree (GPL v3, redistributable) ($env:GITHUB_SHA). Unsigned test build - verify SHA256SUMS.txt. Source: KDE release tarball + this workflow + craft/ (GPL-3.0); build-log.zip lists every Craft package."
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE/logs/build.log" -DestinationPath "$env:GITHUB_WORKSPACE/build-log.zip" -Force
+          gh release create "glaxnimate-$env:GITHUB_RUN_NUMBER" @((Get-ChildItem "$env:GITHUB_WORKSPACE/out").FullName) "$env:GITHUB_WORKSPACE/build-log.zip" --prerelease --title "Glaxnimate $env:GLAXNIMATE_VERSION (VAS build $env:GITHUB_RUN_NUMBER)" --notes $notes --target $env:GITHUB_SHA
+
+      - name: Publish logs on failure
+        if: failure()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $logs = "C:/Craft/$env:CRAFT_TARGET/logs"
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/logs" | Out-Null
+          if (Test-Path $logs) { Compress-Archive -Path "$logs/*" -DestinationPath "$env:GITHUB_WORKSPACE/logs/craft-logs.zip" -Force }
+          "run $env:GITHUB_RUN_NUMBER failed at $(Get-Date -Format o)" | Set-Content "$env:GITHUB_WORKSPACE/logs/README.txt"
+          gh release create "glaxnimate-logs-$env:GITHUB_RUN_NUMBER" (Get-ChildItem "$env:GITHUB_WORKSPACE/logs").FullName --prerelease --title "Glaxnimate build logs $env:GITHUB_RUN_NUMBER (failed)" --notes "Craft logs of a failed build." --target $env:GITHUB_SHA

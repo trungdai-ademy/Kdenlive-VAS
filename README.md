@@ -73,3 +73,18 @@ Push to `main` (or run the workflow manually). The job:
 
 Builds are **unsigned test builds**. VAS verifies them (hash, contents, antivirus) before use and renders its frame-exact golden test suite
 with them before they can replace the official Kdenlive in VAS.
+
+## Other builds in this repository (14/11/2026)
+
+VAS also redistributes these, rebuilt here because KDE's own Windows binaries ship FFmpeg configured with `--enable-nonfree`
+("nonfree and unredistributable") although no nonfree library is enabled. Each build drops that flag and rebuilds FFmpeg in the job;
+packaging fails unless every `avcodec` DLL says "GPL version 3 or later".
+
+| Workflow | Release tag | What |
+|---|---|---|
+| `build-windows.yml` | `build-N` | Kdenlive v26.08.2 + VAS patches (`patches/`, `patches/mlt/`) |
+| `build-kdenlive-upstream.yml` | `upstream-N` | Kdenlive v26.08.2 **without** patches - VAS's "official Kdenlive" fallback |
+| `build-glaxnimate.yml` | `glaxnimate-N` | Glaxnimate 0.6.0 (KDE blueprint, MSVC 2022 like KDE's release) |
+
+Corresponding source: the upstream tag/tarball, this repository at the release commit, and the Craft packages listed in each release's `build-log.zip`.
+

@@ -1,0 +1,171 @@
+# Build UNPATCHED Kdenlive (upstream tag, MLT at the blueprint commit) for Windows with KDE Craft - VAS's fallback "official Kdenlive" (switch in
+# VAS Settings). Rebuilt by us because KDE's own binary ships FFmpeg configured with --enable-nonfree ("nonfree and unredistributable").
+# (invent.kde.org/sysadmin/craft-ci gitlab-templates/blocks/windows-base.yml). Result (or the Craft logs on failure) is published as a
+# GitHub pre-release so it can be downloaded without credentials and then verified by VAS's safety gate before use.
+name: build-kdenlive-upstream
+
+on:
+  push:
+    branches: [main]
+    paths: ["craft/**", ".github/workflows/build-kdenlive-upstream.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    env:
+      PYTHONUTF8: "1"
+      KDENLIVE_TAG: v26.08.2
+      # the exact MLT commit KDE Craft builds for Kdenlive (craft-blueprints-kde libs/mlt/mlt.py defaultTarget 7a3319f), built unpatched
+      MLT_COMMIT: 7a3319fc6dbfa2fbf8fe90b5b94344a210ce4f8c
+      # same target as KDE's official Windows release (MinGW); see craft/CraftConfig.ini
+      CRAFT_TARGET: windows-mingw_64-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upstream source (no patches)
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch $env:KDENLIVE_TAG https://invent.kde.org/multimedia/kdenlive.git C:/kdenlive-src
+          if ($LASTEXITCODE) { exit 1 }
+
+      - name: MLT source (pinned, no patches)
+        shell: pwsh
+        run: |
+          git init -q C:/mlt-src
+          Push-Location C:/mlt-src
+          git remote add origin https://github.com/mltframework/mlt.git
+          git fetch -q --depth 1 origin $env:MLT_COMMIT; if ($LASTEXITCODE) { exit 1 }
+          git checkout -q FETCH_HEAD
+          # submodules (glaxnimate module source, pinned by MLT): run 11 failed without them ("glaxnimate/src/core/ is not an existing directory")
+          git submodule update --init --recursive --depth 1
+          if ($LASTEXITCODE) { git submodule update --init --recursive; if ($LASTEXITCODE) { exit 1 } }
+          if (-not (Test-Path src/modules/glaxnimate/glaxnimate/src/core)) { Write-Error "MLT glaxnimate submodule missing"; exit 1 }
+          Pop-Location
+
+      - name: Craft tooling
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force C:/Craft | Out-Null
+          git clone --depth 1 https://invent.kde.org/packaging/craftmaster.git C:/Craft/craftmaster
+          $py = (Split-Path (Get-Command python).Source).Replace('\', '/')
+          (Get-Content "$env:GITHUB_WORKSPACE/craft/CraftConfig.ini" -Raw).Replace('@PYTHON_DIR@', $py) | Set-Content C:/Craft/CraftConfig.ini -Encoding utf8
+
+      - name: Build and package
+        shell: pwsh
+        run: |
+          Set-Location C:/Craft
+          $jobStart = Get-Date
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/logs" | Out-Null
+          $log = "$env:GITHUB_WORKSPACE/logs/build.log"
+          # full output kept in logs/build.log (published on failure); the console shows each step's tail
+          function CM {
+            "===== CraftMaster $args" | Add-Content $log
+            python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET @args *>> $log
+            $code = $LASTEXITCODE
+            Get-Content $log -Tail 25
+            if ($code -ne 0) { exit $code }
+          }
+          CM --setup
+          CM -c -i --options virtual.ignored=True --update craft
+          # downloads (MSYS2 mirrors, KDE cache) sometimes stall (run 2: "Operation too slow" on an MSYS2 mirror) -> retry the network-heavy steps
+          function CMRetry {
+            for ($i = 1; $i -le 3; $i++) {
+              "===== CraftMaster (attempt $i) $args" | Add-Content $log
+              python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET @args *>> $log
+              $code = $LASTEXITCODE
+              Get-Content $log -Tail 15
+              if ($code -eq 0) { return }
+              Start-Sleep -Seconds 60
+            }
+            exit $code
+          }
+          CMRetry -c --install-deps --options "[CodeSigning]Enabled=False" kdenlive
+          # MLT and Kdenlive from the patched sources (srcDir set in craft/CraftConfig.ini, so every later step sees the same versions)
+          # KDE's MinGW binary cache is out of sync: the cached libFLAC, libsndfile and sox import ogg.dll, the cached libogg provides libogg-0.dll
+          # (build 12: the MLT sox module did not load, sox audio effects silently missing). Rebuild them against the installed libogg, before MLT.
+          # FFmpeg: KDE's blueprint passes --enable-nonfree, which labels the DLLs "nonfree and unredistributable" although no nonfree library
+          # (decklink, libfdk_aac, libmpeghdec) is enabled - we redistribute, so drop the flag and rebuild FFmpeg here (same version and ABI)
+          $ffbp = "C:/Craft/etc/blueprints/locations/craft-blueprints-kde/libs/ffmpeg/ffmpeg.py"
+          $ff = Get-Content $ffbp -Raw
+          if (([regex]::Matches($ff, '"--enable-nonfree",')).Count -ne 1) { Write-Error "ffmpeg blueprint: expected exactly one --enable-nonfree"; exit 1 }
+          Set-Content $ffbp ($ff -replace '\s*"--enable-nonfree",', '') -NoNewline
+          CM -c --no-cache -i libs/ffmpeg
+          CM -c --no-cache -i libs/libflac
+          CM -c --no-cache -i libs/libsndfile
+          CM -c --no-cache -i libs/sox
+          # -i: install over the cached MLT of the same version (run 8: "libs/mlt is up to date, nothing to do" -> cached melt shipped)
+          CM -c --no-cache -i libs/mlt
+          CM -c --no-cache kdenlive
+          CMRetry -c -i --update nsis
+          CM -c --package kdenlive
+          $pkg = (python -u craftmaster/CraftMaster.py --config C:/Craft/CraftConfig.ini --target $env:CRAFT_TARGET -c -q --get "packageDestinationDir()" virtual/base | Select-Object -Last 1).Trim()
+          Write-Host "package dir: $pkg"
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/out" | Out-Null
+          Get-ChildItem -Path $pkg -Recurse -Include *.exe, *.7z | Copy-Item -Destination "$env:GITHUB_WORKSPACE/out"
+          # repack the .7z without the files listed in craft/exclude-from-package.txt (antivirus false positives, documented there)
+          $excl = @(Get-Content "$env:GITHUB_WORKSPACE/craft/exclude-from-package.txt" | Where-Object { $_.Trim() -and -not $_.StartsWith('#') } | ForEach-Object { $_.Trim().Replace('/', [IO.Path]::DirectorySeparatorChar) })
+          $orig = Get-ChildItem "$env:GITHUB_WORKSPACE/out/*.7z" | Select-Object -First 1
+          $tmp = "C:/repack"
+          & 7z x $orig.FullName "-o$tmp" -y | Out-Null; if ($LASTEXITCODE) { exit 1 }
+          # an entry that is not in the package is an ERROR (run 4: a broken path silently excluded nothing)
+          foreach ($e in $excl) { $f = Join-Path $tmp $e; if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force; Write-Host "excluded $e" } else { Write-Error "exclude entry not found in package: $e"; exit 1 } }
+          foreach ($e in $excl) { if (Test-Path -LiteralPath (Join-Path $tmp $e)) { Write-Error "still present after exclusion: $e"; exit 1 } }
+          # melt / MLT / Kdenlive must be the ones built in THIS job from the pinned sources, not KDE's cached ones
+          foreach ($b in "bin/melt.exe", "bin/libmlt-7.dll", "bin/kdenlive.exe") {
+            $f = Get-Item -LiteralPath (Join-Path $tmp $b) -ErrorAction SilentlyContinue
+            if (-not $f) { Write-Error "missing from package: $b"; exit 1 }
+            if ($f.LastWriteTime -lt $jobStart) { Write-Error "$b in the package is not from this build ($($f.LastWriteTime) < $jobStart): cached binary"; exit 1 }
+            Write-Host "built in this job: $b $($f.LastWriteTime)"
+          }
+          # redistributable FFmpeg: every libav* DLL must carry the GPL v3 licence string (KDE's cached FFmpeg says "nonfree and unredistributable")
+          foreach ($f in Get-ChildItem (Join-Path $tmp "bin") -Filter "av*.dll") {
+            $t = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($f.FullName))
+            if ($t.Contains("nonfree and unredistributable")) { Write-Error "$($f.Name): FFmpeg built with --enable-nonfree (not redistributable)"; exit 1 }
+            if ($f.Name -like "avcodec*" -and -not $t.Contains("license: GPL version 3 or later")) { Write-Error "$($f.Name): unexpected FFmpeg licence"; exit 1 }
+          }
+          Write-Host "FFmpeg licence: GPL version 3 or later (redistributable)"
+          # every exe / dll in the package must find its imports in the package or in Windows (build 12: ogg.dll missing -> sox module not loaded)
+          & "$env:GITHUB_WORKSPACE/craft/check-imports.ps1" -Root $tmp
+          if ($LASTEXITCODE) { Write-Error "package has unresolved DLL imports (see above)"; exit 1 }
+          Remove-Item $orig.FullName
+          Push-Location $tmp
+          & 7z a -t7z -mx=7 "$env:GITHUB_WORKSPACE/out/kdenlive-upstream-$env:GITHUB_RUN_NUMBER-windows-x86_64.7z" * | Out-Null; if ($LASTEXITCODE) { exit 1 }
+          Pop-Location
+          Get-ChildItem "$env:GITHUB_WORKSPACE/out" | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content "$env:GITHUB_WORKSPACE/out/SHA256SUMS.txt" -Encoding ascii
+          Get-ChildItem "$env:GITHUB_WORKSPACE/out"
+
+      - name: Publish build
+        if: success()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = "Kdenlive $env:KDENLIVE_TAG WITHOUT VAS patches, MLT $env:MLT_COMMIT ($env:GITHUB_SHA). FFmpeg built without --enable-nonfree (GPL v3, redistributable). Unsigned test build - verify SHA256SUMS.txt. The .7z omits the files listed in craft/exclude-from-package.txt (antivirus false positives). Source: upstream tag + this workflow + craft/ (GPL-3.0); build-log.zip lists every Craft package."
+          # build log attached too (run 7: the package silently used cached MLT and there was no log to see why)
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE/logs/build.log" -DestinationPath "$env:GITHUB_WORKSPACE/build-log.zip" -Force
+          $extra = @("$env:GITHUB_WORKSPACE/build-log.zip")
+          # debug symbols of kdenlive.exe (best effort): turn a crash offset from the Windows event log into a function name
+          $pdb = Get-ChildItem "C:/Craft/$env:CRAFT_TARGET/build" -Recurse -Filter kdenlive.pdb -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 1
+          if ($pdb) { Compress-Archive -Path $pdb.FullName -DestinationPath "$env:GITHUB_WORKSPACE/kdenlive-pdb.zip" -Force; $extra += "$env:GITHUB_WORKSPACE/kdenlive-pdb.zip"; Write-Host "pdb: $($pdb.FullName)" } else { Write-Host "no kdenlive.pdb found" }
+          gh release create "upstream-$env:GITHUB_RUN_NUMBER" @((Get-ChildItem "$env:GITHUB_WORKSPACE/out").FullName) @extra --prerelease --title "Kdenlive upstream (no VAS patches) build $env:GITHUB_RUN_NUMBER" --notes $notes --target $env:GITHUB_SHA
+
+      - name: Publish logs on failure
+        if: failure()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $logs = "C:/Craft/$env:CRAFT_TARGET/logs"
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/logs" | Out-Null
+          if (Test-Path $logs) { Compress-Archive -Path "$logs/*" -DestinationPath "$env:GITHUB_WORKSPACE/logs/craft-logs.zip" -Force }
+          "run $env:GITHUB_RUN_NUMBER failed at $(Get-Date -Format o)" | Set-Content "$env:GITHUB_WORKSPACE/logs/README.txt"
+          gh release create "upstream-logs-$env:GITHUB_RUN_NUMBER" (Get-ChildItem "$env:GITHUB_WORKSPACE/logs").FullName --prerelease --title "Build logs $env:GITHUB_RUN_NUMBER (failed)" --notes "Craft logs of a failed build." --target $env:GITHUB_SHA
