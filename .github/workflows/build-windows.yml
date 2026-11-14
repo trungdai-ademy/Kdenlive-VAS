@@ -103,6 +103,13 @@ jobs:
           # MLT and Kdenlive from the patched sources (srcDir set in craft/CraftConfig.ini, so every later step sees the same versions)
           # KDE's MinGW binary cache is out of sync: the cached libFLAC, libsndfile and sox import ogg.dll, the cached libogg provides libogg-0.dll
           # (build 12: the MLT sox module did not load, sox audio effects silently missing). Rebuild them against the installed libogg, before MLT.
+          # FFmpeg: KDE's blueprint passes --enable-nonfree, which labels the DLLs "nonfree and unredistributable" although no nonfree library
+          # (decklink, libfdk_aac, libmpeghdec) is enabled - we redistribute, so drop the flag and rebuild FFmpeg here (same version and ABI)
+          $ffbp = "C:/Craft/etc/blueprints/locations/craft-blueprints-kde/libs/ffmpeg/ffmpeg.py"
+          $ff = Get-Content $ffbp -Raw
+          if (([regex]::Matches($ff, '"--enable-nonfree",')).Count -ne 1) { Write-Error "ffmpeg blueprint: expected exactly one --enable-nonfree"; exit 1 }
+          Set-Content $ffbp ($ff -replace '\s*"--enable-nonfree",', '') -NoNewline
+          CM -c --no-cache -i libs/ffmpeg
           CM -c --no-cache -i libs/libflac
           CM -c --no-cache -i libs/libsndfile
           CM -c --no-cache -i libs/sox
@@ -130,6 +137,13 @@ jobs:
             if ($f.LastWriteTime -lt $jobStart) { Write-Error "$b in the package is not from this build ($($f.LastWriteTime) < $jobStart): cached binary"; exit 1 }
             Write-Host "built in this job: $b $($f.LastWriteTime)"
           }
+          # redistributable FFmpeg: every libav* DLL must carry the GPL v3 licence string (KDE's cached FFmpeg says "nonfree and unredistributable")
+          foreach ($f in Get-ChildItem (Join-Path $tmp "bin") -Filter "av*.dll") {
+            $t = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($f.FullName))
+            if ($t.Contains("nonfree and unredistributable")) { Write-Error "$($f.Name): FFmpeg built with --enable-nonfree (not redistributable)"; exit 1 }
+            if ($f.Name -like "avcodec*" -and -not $t.Contains("license: GPL version 3 or later")) { Write-Error "$($f.Name): unexpected FFmpeg licence"; exit 1 }
+          }
+          Write-Host "FFmpeg licence: GPL version 3 or later (redistributable)"
           # every exe / dll in the package must find its imports in the package or in Windows (build 12: ogg.dll missing -> sox module not loaded)
           & "$env:GITHUB_WORKSPACE/craft/check-imports.ps1" -Root $tmp
           if ($LASTEXITCODE) { Write-Error "package has unresolved DLL imports (see above)"; exit 1 }
