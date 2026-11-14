@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write   # OIDC token for Azure Artifact Signing (craft/signing.json)
 
 jobs:
   build:
@@ -151,11 +152,58 @@ jobs:
           & "$env:GITHUB_WORKSPACE/craft/check-imports.ps1" -Root $tmp
           if ($LASTEXITCODE) { Write-Error "package has unresolved DLL imports (see above)"; exit 1 }
           Remove-Item $orig.FullName
+
+      # Authenticode (Azure Artifact Signing, OIDC - no secrets): craft/signing.json "enabled" turns it on. Every exe/dll of the package tree is signed;
+      # Smart App Control blocks unsigned builds on users' machines (14/11: kdenlive.exe of upstream-3 blocked on the dev machine)
+      - name: Signing config
+        id: signcfg
+        shell: pwsh
+        run: |
+          $c = Get-Content "$env:GITHUB_WORKSPACE/craft/signing.json" -Raw | ConvertFrom-Json
+          "enabled=$(if ($c.enabled) { 'true' } else { 'false' })" >> $env:GITHUB_OUTPUT
+          foreach ($k in "endpoint", "account", "profile", "tenantId", "clientId", "subscriptionId") { "$k=$($c.$k)" >> $env:GITHUB_OUTPUT }
+          Write-Host "signing enabled: $($c.enabled)"
+
+      - name: Azure login (OIDC)
+        if: steps.signcfg.outputs.enabled == 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906  # v3.1.0
+        with:
+          client-id: ${{ steps.signcfg.outputs.clientId }}
+          tenant-id: ${{ steps.signcfg.outputs.tenantId }}
+          subscription-id: ${{ steps.signcfg.outputs.subscriptionId }}
+
+      - name: Sign every exe / dll of the package
+        if: steps.signcfg.outputs.enabled == 'true'
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82  # v2.0.0
+        with:
+          endpoint: ${{ steps.signcfg.outputs.endpoint }}
+          signing-account-name: ${{ steps.signcfg.outputs.account }}
+          certificate-profile-name: ${{ steps.signcfg.outputs.profile }}
+          files-folder: C:\repack
+          files-folder-filter: exe,dll
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify signatures
+        if: steps.signcfg.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $bad = @(Get-ChildItem C:/repack -Recurse -File -Include *.exe, *.dll | Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' })
+          if ($bad) { $bad | Select-Object -First 20 | ForEach-Object { Write-Host "unsigned: $($_.FullName)" }; Write-Error "$($bad.Count) exe/dll not validly signed"; exit 1 }
+          Write-Host "all exe/dll validly signed: $(@(Get-ChildItem C:/repack -Recurse -File -Include *.exe, *.dll).Count)"
+
+      - name: Repack
+        shell: pwsh
+        run: |
+          $tmp = "C:/repack"
           Push-Location $tmp
           & 7z a -t7z -mx=7 "$env:GITHUB_WORKSPACE/out/kdenlive-vas-$env:GITHUB_RUN_NUMBER-windows-x86_64.7z" * | Out-Null; if ($LASTEXITCODE) { exit 1 }
           Pop-Location
           Get-ChildItem "$env:GITHUB_WORKSPACE/out" | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content "$env:GITHUB_WORKSPACE/out/SHA256SUMS.txt" -Encoding ascii
           Get-ChildItem "$env:GITHUB_WORKSPACE/out"
+
 
       - name: Publish build
         if: success()

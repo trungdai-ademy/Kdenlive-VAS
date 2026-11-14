@@ -1,0 +1,10 @@
+{
+  "_note": "Authenticode signing of every exe/dll in the package with Azure Artifact Signing (OIDC, no secrets). Enable only after the identity validation is Completed and the certificate profile exists. Smart App Control blocks unsigned builds on users' machines (14/11: kdenlive.exe of upstream-3 blocked).",
+  "enabled": false,
+  "endpoint": "https://jpe.codesigning.azure.net/",
+  "account": "vaskyso",
+  "profile": "vas-public",
+  "tenantId": "272fe406-94e7-465e-a2cd-69bb68e163ca",
+  "clientId": "db93560e-769c-4a7e-8669-444c59e80f03",
+  "subscriptionId": "959dc8fa-df25-4310-b275-f068a72278d4"
+}
